@@ -152,11 +152,15 @@ class XgrammarGrammar(StructuredOutputGrammar):
     def accept_tokens(self, request_id: str, tokens: list[int]) -> bool:
         """Accepts a list of tokens and advances the FSM.
 
-        Returns True if the FSM was advanced successfully.
-        Returns False if the FSM failed to advance.
+        Returns True if all grammar-constrained tokens were accepted.
+        Tokens after termination are ignored. Returns False if the FSM
+        failed to advance.
         """
         if self._is_terminated:
-            return False
+            # Spec decode can accept tokens past the grammar's end (the
+            # newline after a closing tag, the stop token, anything under
+            # ignore_eos). They are not grammar content; ignore them.
+            return True
         for token in tokens:
             if not self.matcher.accept_token(token):
                 logger.error(
@@ -167,7 +171,9 @@ class XgrammarGrammar(StructuredOutputGrammar):
                 )
                 return False
             self.num_processed_tokens += 1
-        self._is_terminated = self.matcher.is_terminated()
+            self._is_terminated = self.matcher.is_terminated()
+            if self._is_terminated:
+                break
         return True
 
     def validate_tokens(self, tokens: list[int]) -> list[int]:
