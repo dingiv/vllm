@@ -467,6 +467,13 @@ class CommonAttentionMetadata:
     decode rows (assumes every draft was accepted). Not safe for kernels
     that need exact per-row context lengths on decode rows."""
 
+    seq_lens_cpu_hint: torch.Tensor | None = None
+    """(batch_size,) CPU stand-in for seq_lens supplied by callers that
+    maintain lengths host-side without a device sync. Only set when the
+    caller guarantees it equals the device seq_lens (e.g. a draft
+    speculator on all-prefill rows). The deprecated ``seq_lens_cpu``
+    property prefers it to avoid an implicit D2H sync per step."""
+
     mm_req_doc_ranges: dict[int, list[tuple[int, int]]] | None = None
     """PrefixLM bidirectional ranges for multimodal tokens. Maps
     request index to list of (start, end) token position ranges
@@ -512,7 +519,10 @@ class CommonAttentionMetadata:
     )
     def seq_lens_cpu(self) -> torch.Tensor:
         if self._seq_lens_cpu is None:
-            self._seq_lens_cpu = self.seq_lens.to("cpu")
+            if self.seq_lens_cpu_hint is not None:
+                self._seq_lens_cpu = self.seq_lens_cpu_hint
+            else:
+                self._seq_lens_cpu = self.seq_lens.to("cpu")
         return self._seq_lens_cpu
 
     @property

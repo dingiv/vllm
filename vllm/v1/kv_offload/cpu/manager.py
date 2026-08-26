@@ -26,6 +26,18 @@ from vllm.v1.kv_offload.cpu.common import (
 from vllm.v1.kv_offload.cpu.policies.base import BlockStatus, CachePolicy
 from vllm.v1.kv_offload.cpu.policies.factory import CachePolicyFactory
 
+# LOCAL PROBE: lookup/store traces via vllm.v1.qwen_debug.
+from vllm.v1.qwen_debug import OFFLOAD_PROBE as _QWEN_OFFLOAD_PROBE
+from vllm.v1.qwen_debug import logger as _PROBE_LOG
+# LOCAL (2026-08-27): refuse-to-evict admission control. Per-block LRU eviction
+# shatters a session's chunk chain (oldest group dies first; that group is also
+# first in _lookup_groups, so one zero-hit group vetoes the whole lookup).
+# With this flag, a store that would evict existing blocks is rejected instead,
+# keeping earlier sessions' prefixes intact (FIFO admission).
+_QWEN_OFFLOAD_NO_EVICT = __import__("os").environ.get(
+    "QWEN_OFFLOAD_NO_EVICT", ""
+).lower() in ("1", "true", "yes")
+
 
 class CPUOffloadingManager(OffloadingManager):
     """
@@ -187,6 +199,8 @@ class CPUOffloadingManager(OffloadingManager):
 
         to_evict: list[OffloadKey] = []
         if num_blocks_to_evict > 0:
+            if _QWEN_OFFLOAD_NO_EVICT:
+                return None
             if num_blocks_to_evict > self._num_evictable_cache_blocks:
                 # Eviction will fail.
                 return None
@@ -260,6 +274,18 @@ class CPUOffloadingManager(OffloadingManager):
                     self._num_write_pending_blocks -= 1
                     self._policy.remove(key)
                     self._free_block(block)
+        if _QWEN_OFFLOAD_PROBE and keys:
+            _k0 = next(iter(keys))
+            _PROBE_LOG.info(
+                "[OFFPROBE] complete_store n=%d ready=%d pending_writes=%d "
+                "evictable=%d k0=%s..g%d",
+                len(keys),
+                len(stored_keys),
+                self._num_write_pending_blocks,
+                self._num_evictable_cache_blocks,
+                _k0[:6].hex(),
+                int.from_bytes(_k0[-4:], "big"),
+            )
 
         if stored_keys and self.events is not None:
             self.events.append(

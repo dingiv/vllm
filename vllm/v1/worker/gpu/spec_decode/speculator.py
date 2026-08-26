@@ -216,6 +216,7 @@ class DraftModelSpeculator(BaseSpeculator):
         num_query_per_req: int = 1,
         causal: bool | Mapping[int, bool] = True,
         query_start_loc_np: np.ndarray | None = None,
+        upper_bound_is_exact: bool = False,
     ) -> dict[str, Any] | None:
         if query_start_loc_np is not None:
             # Non-uniform query layout (e.g. multi-module MTP's mixed
@@ -266,6 +267,14 @@ class DraftModelSpeculator(BaseSpeculator):
             kv_cache_config=self.kv_cache_config,
             causal=causal,
             seq_lens_cpu_upper_bound=draft_seq_lens_cpu_upper_bound,
+            # When every row is a prefill row, the target-side upper bound is
+            # exact, so target_bound + step == the device seq_lens maintained
+            # by the draft input kernel (context + query). Feeding it as the
+            # CPU hint lets attention builders skip the per-step implicit
+            # D2H sync in the deprecated seq_lens_cpu property.
+            seq_lens_cpu_hint=draft_seq_lens_cpu_upper_bound
+            if upper_bound_is_exact
+            else None,
         )
         return attn_metadata
 

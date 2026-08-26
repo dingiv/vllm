@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import os
+import time
 from collections.abc import Mapping
 from typing import Any
 
@@ -29,12 +30,17 @@ from vllm.v1.worker.utils import AttentionGroup
 
 logger = init_logger(__name__)
 
+# LOCAL PROBE: per-propose phase breakdown via vllm.v1.qwen_debug
+# (QWEN_DEBUG=timing, or legacy QWEN_TIMING=1 every propose / =2 1-in-50).
+from vllm.v1.qwen_debug import TIMING as _QWEN_TIMING
+
 
 class DFlashSpeculator(DraftModelSpeculator):
     _speculator_name = "DFlash"  # For logging, so we can share methods with subclasses
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         super().__init__(vllm_config, device)
+        self._tim_ctr = 0
 
         self.hidden_states = torch.zeros(
             self.max_num_tokens, self.hidden_size, dtype=self.dtype, device=device
@@ -314,6 +320,7 @@ class DFlashSpeculator(DraftModelSpeculator):
         num_query_per_req: int | None = None,
         causal: bool | Mapping[int, bool] = False,
         query_start_loc_np: np.ndarray | None = None,
+        upper_bound_is_exact: bool = False,
     ) -> dict[str, Any] | None:
         if not self.draft_attn_layer_names:
             return None
@@ -327,6 +334,7 @@ class DFlashSpeculator(DraftModelSpeculator):
             num_query_per_req=self.num_query_per_req,
             causal=causal,
             query_start_loc_np=query_start_loc_np,
+            upper_bound_is_exact=upper_bound_is_exact,
         )
 
     @torch.inference_mode()
@@ -357,6 +365,10 @@ class DFlashSpeculator(DraftModelSpeculator):
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
         is_profile: bool = False,
     ) -> torch.Tensor:
+        # QWEN_TIMING=1: every propose; =2: 1-in-50 sampling; else off.
+        _tim = _QWEN_TIMING == 1 or (_QWEN_TIMING >= 2 and self._tim_ctr % 50 == 0)
+        self._tim_ctr += 1
+        _t0 = time.perf_counter() if _tim else 0.0
         num_reqs = input_batch.num_reqs
         # What the step that just ran actually produced per request: num_sampled counts the
         # sampling slots it was given (bonus + drafts), num_rejected how many of those were
@@ -435,6 +447,7 @@ class DFlashSpeculator(DraftModelSpeculator):
                 self.max_model_len,
                 self.sample_from_anchor,
             )
+        _t1 = time.perf_counter() if _tim else 0.0
 
         # Pre-insert context K/V into the cache. Runs eagerly outside the captured graph
         # because the context shape varies per step. During dummy runs the block tables
@@ -454,6 +467,7 @@ class DFlashSpeculator(DraftModelSpeculator):
             self.context_positions[:num_target_tokens],
             context_slots,
         )
+        _t2 = time.perf_counter() if _tim else 0.0
 
         # Every DFlash step has exactly num_query_per_req tokens, so we can use FULL CGs
         batch_desc, num_tokens_across_dp = dispatch_cg_and_sync_dp(
@@ -469,6 +483,15 @@ class DFlashSpeculator(DraftModelSpeculator):
         num_reqs_padded = batch_desc.num_reqs or num_reqs
         num_tokens_padded = batch_desc.num_tokens
 
+        # On prefill-only rows the target-side CPU upper bound is exact
+        # (scheduler-maintained, no D2H), and the draft input kernel derives
+        # its device seq_lens as bound + num_query_per_req (clamped to
+        # max_model_len) — identical values. Feed it as the CPU hint so the
+        # attention metadata build skips the per-step implicit D2H sync.
+        # Decode / mixed batches keep the exact sync: the bound is optimistic
+        # there and overshoot would poison draft attention with stale pages.
+        upper_bound_is_exact = bool(input_batch.is_prefilling_np[:num_reqs].all())
+
         # Rebuild the draft attention metadata even when replaying the FULL
         # graph so that any attention metadata builder state is updated.
         draft_attn_metadata = self._build_draft_attn_metadata(
@@ -478,11 +501,13 @@ class DFlashSpeculator(DraftModelSpeculator):
             seq_lens_cpu_upper_bound=input_batch.seq_lens_cpu_upper_bound,
             step=self.num_query_per_req,
             causal=self._group_causal,
+            upper_bound_is_exact=upper_bound_is_exact,
         )
         draft_slot_mappings_by_layer = build_slot_mappings_by_layer(
             self.block_tables.slot_mappings[:, :num_tokens_padded],
             self.kv_cache_config,
         )
+        _t3 = time.perf_counter() if _tim else 0.0
 
         # DFlash processes all speculative tokens in one forward pass,
         # so the real token count is num_query_tokens.
@@ -499,6 +524,19 @@ class DFlashSpeculator(DraftModelSpeculator):
                 draft_slot_mappings_by_layer,
                 num_tokens_across_dp=num_tokens_across_dp,
                 cudagraph_runtime_mode=batch_desc.cg_mode,
+            )
+        _t4 = time.perf_counter() if _tim else 0.0
+        if _tim:
+            logger.info(
+                "[QTIM] propose=%.1fms prep=%.1fms ctx_kv=%.1fms "
+                "meta=%.1fms fwd=%.1fms ntt=%d exact=%d",
+                1000 * (_t4 - _t0),
+                1000 * (_t1 - _t0),
+                1000 * (_t2 - _t1),
+                1000 * (_t3 - _t2),
+                1000 * (_t4 - _t3),
+                num_target_tokens,
+                int(upper_bound_is_exact),
             )
 
         return self.draft_tokens[:num_reqs]

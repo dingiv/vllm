@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 import time
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
@@ -57,6 +58,25 @@ from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request, RequestStatus
 
 logger = init_logger(__name__)
+
+# LOCAL PROBE: lookup/store traces via vllm.v1.qwen_debug (QWEN_DEBUG=offload
+# or the legacy QWEN_OFFLOAD_PROBE=1 alias).
+from vllm.v1.qwen_debug import OFFLOAD_PROBE as _QWEN_OFFLOAD_PROBE
+
+# LOCAL (2026-08-27, qwen38 project): checkpoint-stride sparsification for
+# recurrent / SWA groups. On hybrid-GDN topologies (Qwen3.8-DFlash2) every
+# group's chunk boundary is a valid full-attention boundary, so the natural
+# alignment optimization below never engages and ALL recurrent chunks are
+# stored — yet loads only ever read the trailing sw(+eagle) chunk window at
+# the final hit boundary (~77% of tier bytes are dead weight). This env sets
+# an explicit stride S: only the trailing window of each S-chunk segment is
+# stored (a "checkpoint band"). The backward sliding-window lookup lands on
+# bands organically and the convergence loop clamps the hit boundary to
+# min(FA first-miss, last complete band). Chunks born during incremental
+# decode are trailing at their turn, so decode tails stay dense — the region
+# a revisit needs contiguous. Keys stay content-hashed, so sessions sharing
+# a prefix share band chunks with no coordination.
+_QWEN_OFFLOAD_CKPT_STRIDE = int(os.environ.get("QWEN_OFFLOAD_CHECKPOINT_STRIDE", "0") or "0")
 
 KV_LOAD_TIERS_KEY = "kv_load_tiers"
 MATCHER_MEDIUM_KEY = "medium"
@@ -198,6 +218,20 @@ class SchedulerOffloadConfig(NamedTuple):
         ) -> int | None:
             if alignment_tokens is None or sliding_window_size_in_chunks is None:
                 return None
+            if _QWEN_OFFLOAD_CKPT_STRIDE > 0:
+                # LOCAL: explicit stride overrides the natural derivation,
+                # which never engages when every chunk is already an
+                # FA-boundary candidate (hybrid-GDN chunk >= FA alignment).
+                # Cap at the natural value when one exists (more checkpoints
+                # than the natural layout are never harmful, only denser).
+                natural = None
+                if alignment_tokens > tokens_per_chunk:
+                    per_segment = alignment_tokens // tokens_per_chunk
+                    if sliding_window_size_in_chunks < per_segment:
+                        natural = per_segment
+                return min(natural, _QWEN_OFFLOAD_CKPT_STRIDE) if natural else (
+                    _QWEN_OFFLOAD_CKPT_STRIDE
+                )
             if alignment_tokens <= tokens_per_chunk:
                 return None
             per_segment = alignment_tokens // tokens_per_chunk
@@ -340,6 +374,7 @@ class RequestOffloadState:
         group_config: "GroupOffloadConfig",
         group_state: RequestGroupState,
         num_offloadable_tokens: int,
+        is_finished: bool = False,
     ) -> int:
         """Number of allocated leading offloaded chunks eligible for store.
 
@@ -353,10 +388,25 @@ class RequestOffloadState:
         each step is skipped on collection but jumped over by
         ``next_stored_chunk_idx``, so it is never re-considered and a
         permanent hole breaks prefix-reuse lookup.
+
+        LOCAL: once the request is finished there is no future spec-token
+        rewrite, so the final chunk is stable and is stored. Without this,
+        checkpoint bands whose last chunk is the request tail are
+        permanently one chunk short and lookups fall to the previous band.
         """
         num_chunks = num_offloadable_tokens // group_config.tokens_per_chunk
         is_decoding = num_offloadable_tokens > self.req.num_prompt_tokens
-        if group_config.is_eagle_group and is_decoding:
+        # LOCAL: with checkpoint-stride bands, the final chunk of a finished
+        # request is the anchor of the last band; permanently excluding it
+        # makes every band ending at the request tail one chunk short and
+        # drops lookups to the previous band. Once finished there is no
+        # future spec-token rewrite, so the chunk is stable and is stored.
+        # Gated on the stride so upstream dense-store semantics are intact.
+        if (
+            group_config.is_eagle_group
+            and is_decoding
+            and not (is_finished and _QWEN_OFFLOAD_CKPT_STRIDE > 0)
+        ):
             num_chunks = max(0, num_chunks - 1)
         num_allocated_chunks = (
             len(group_state.block_ids) // self.config.blocks_per_chunk
@@ -457,6 +507,22 @@ class OffloadingConnectorScheduler:
         self.manager: OffloadingManager = spec.get_manager()
         self._connector_stats = OffloadingConnectorStats()
 
+        if _QWEN_OFFLOAD_PROBE:
+            logger.info(
+                "[OFFPROBE] group configs (ckpt_stride=%d): %s",
+                _QWEN_OFFLOAD_CKPT_STRIDE,
+                [
+                    (
+                        gc.group_idx,
+                        gc.tokens_per_chunk,
+                        gc.hashes_per_chunk,
+                        gc.sliding_window_size_in_chunks,
+                        gc.alignment_chunk_count,
+                    )
+                    for gc in self.config.kv_group_configs
+                ],
+            )
+
         full_attention_groups: list[int] = []
         sliding_window_groups: list[int] = []
         for group_config in self.config.kv_group_configs:
@@ -549,11 +615,13 @@ class OffloadingConnectorScheduler:
         req: Request,
         group_config: GroupOffloadConfig,
         start_chunk_idx: int,
+        max_hit_tokens: int = 0,
     ) -> int | None:
         """Return the number of consecutive offloaded chunks from the start,
         or None if the backend deferred a lookup."""
         hit_count = 0
         defer_lookup = False
+        _first_miss = -1
         for local_idx, key in enumerate(keys):
             result = self.manager.lookup(key, req_context)
             match result:
@@ -573,7 +641,19 @@ class OffloadingConnectorScheduler:
                     # async lookups (until a miss is detected).
                     defer_lookup = True
                 case LookupResult.MISS:
+                    _first_miss = local_idx
                     break
+        if _QWEN_OFFLOAD_PROBE:
+            logger.info(
+                "[OFFPROBE]   prefix-lookup g%d mh=%d scanned=%d hit=%d first_miss_local=%d "
+                "defer=%s",
+                group_config.group_idx,
+                max_hit_tokens,
+                len(keys),
+                hit_count,
+                _first_miss,
+                defer_lookup,
+            )
         return hit_count if not defer_lookup else None
 
     def _sliding_window_lookup(
@@ -581,12 +661,14 @@ class OffloadingConnectorScheduler:
         keys: Sequence[OffloadKey],
         sliding_window_size: int,
         req_context: ReqContext,
+        group_idx: int = -1,
     ) -> int | None:
         """Return the end index (in `keys`) of the last run of
         `sliding_window_size` consecutive hits, scanning from the end.
         Returns 0 on miss, None if the backend deferred a lookup."""
         defer_lookup = False
         consecutive_hits = 0
+        result: int | None = 0
         for idx in range(len(keys) - 1, -1, -1):
             match self.manager.lookup(keys[idx], req_context):
                 case LookupResult.HIT:
@@ -606,8 +688,33 @@ class OffloadingConnectorScheduler:
                 case LookupResult.MISS:
                     consecutive_hits = 0
             if consecutive_hits == sliding_window_size:
-                return idx + sliding_window_size if not defer_lookup else None
-        return consecutive_hits if not defer_lookup else None
+                result = idx + sliding_window_size
+                break
+        else:
+            result = consecutive_hits
+        result = result if not defer_lookup else None
+        if _QWEN_OFFLOAD_PROBE:
+            _tail_verdicts = []
+            if result == 0:
+                for _k in list(keys)[-3:]:
+                    _tail_verdicts.append(
+                        self.manager.lookup(_k, req_context).name
+                    )
+            logger.info(
+                "[OFFPROBE]   sw-lookup g%d window=%d scanned=%d result=%s defer=%s "
+                "k_first=%s..g%d k_last=%s..g%d tail=%s",
+                group_idx,
+                sliding_window_size,
+                len(keys),
+                result,
+                defer_lookup,
+                keys[0][:6].hex() if keys else "-",
+                int.from_bytes(keys[0][-4:], "big") if keys else -1,
+                keys[-1][:6].hex() if keys else "-",
+                int.from_bytes(keys[-1][-4:], "big") if keys else -1,
+                _tail_verdicts,
+            )
+        return result
 
     def _touch(self, req_status: RequestOffloadState):
         for group_config, group_state in zip(
@@ -713,6 +820,7 @@ class OffloadingConnectorScheduler:
                         req_status.req,
                         group_config,
                         start_chunk_idx,
+                        max_hit_size_tokens,
                     )
                 else:
                     required_window = sliding_window_size_in_chunks
@@ -722,6 +830,7 @@ class OffloadingConnectorScheduler:
                         offload_keys,
                         required_window,
                         req_status.req_context,
+                        group_idx=group_idx,
                     )
                 if num_hit_chunks == 0:
                     return 0
@@ -729,8 +838,19 @@ class OffloadingConnectorScheduler:
                 if num_hit_chunks is None:
                     defer_lookup = True
                 else:
-                    if is_eagle_unverified:
+                    # LOCAL: the per-group eagle pop stacks across groups
+                    # when ALL groups are eagle (DFlash2 marks every group),
+                    # shaving one chunk per group off the convergence clamp
+                    # and cascading band lookups down to earlier checkpoints.
+                    # The pop guards against volatile trailing chunks, but
+                    # storable_chunks already refuses to store any chunk
+                    # while it is the volatile decode tail, so every stored
+                    # chunk is stable and the pop is redundant here. Gate on
+                    # the checkpoint stride to keep upstream semantics.
+                    if is_eagle_unverified and _QWEN_OFFLOAD_CKPT_STRIDE == 0:
                         num_hit_chunks -= 1
+                        eagle_verified.add(group_idx)
+                    elif is_eagle_unverified:
                         eagle_verified.add(group_idx)
 
                     max_hit_size_tokens = min(
@@ -855,6 +975,17 @@ class OffloadingConnectorScheduler:
         else:
             lookup_start = time.monotonic()
             num_hit_tokens = self._lookup(req_status)
+            if _QWEN_OFFLOAD_PROBE:
+                _keys_per_group = [
+                    len(gs.offload_keys) for gs in req_status.group_states
+                ]
+                logger.info(
+                    "[OFFPROBE] lookup req=%s local=%d hit=%s keys_per_group=%s",
+                    request.request_id[:10],
+                    num_computed_tokens,
+                    num_hit_tokens,
+                    _keys_per_group,
+                )
             self._connector_stats.observe_histogram(
                 _ConnectorMetricName.LOOKUP_SYNC_DELAY,
                 time.monotonic() - lookup_start,
@@ -901,18 +1032,30 @@ class OffloadingConnectorScheduler:
             num_gpu_blocks = cdiv(num_cached_tokens, tokens_per_block)
 
             assert len(group_blocks) >= num_gpu_blocks
-            num_locally_computed_gpu_blocks = num_gpu_blocks
-            # Skip null placeholder blocks (used for sliding window or mamba padding).
-            for i, block in enumerate(group_blocks[:num_gpu_blocks]):
+            # ``load_start_gpu_block_idx``: the index in ``group_blocks`` where the
+            # load region begins -- a slice bound, not a count of computed blocks.
+            # Scan from the computed boundary, not 0: ``num_locally_computed_tokens``
+            # is block-aligned by the caller, so lower blocks are computed by
+            # definition, and a recurrent (Mamba / GDN) group legitimately holds a
+            # non-null *unhashed* block there -- a fixed-size state, not per-token
+            # KV. Taking that as the start drags the boundary below the computed
+            # mark and trips the assert. Skip nulls: block 0 is the shared sentinel
+            # and must never be a load destination.
+            first_fresh_gpu_block_idx = cdiv(
+                num_locally_computed_tokens, tokens_per_block
+            )
+            load_start_gpu_block_idx = num_gpu_blocks
+            for i in range(first_fresh_gpu_block_idx, num_gpu_blocks):
+                block = group_blocks[i]
                 if not block.is_null and block.block_hash is None:
-                    num_locally_computed_gpu_blocks = i
+                    load_start_gpu_block_idx = i
                     break
 
             assert (
                 num_locally_computed_tokens
-                <= num_locally_computed_gpu_blocks * tokens_per_block
+                <= load_start_gpu_block_idx * tokens_per_block
             )
-            num_pending_gpu_blocks = num_gpu_blocks - num_locally_computed_gpu_blocks
+            num_pending_gpu_blocks = num_gpu_blocks - load_start_gpu_block_idx
 
             if group_config.sliding_window_size_in_chunks is not None:
                 assert (
@@ -926,18 +1069,16 @@ class OffloadingConnectorScheduler:
             assert len(offload_keys) >= num_chunks
             if num_pending_gpu_blocks:
                 start_chunk_idx = (
-                    num_locally_computed_gpu_blocks // self.config.blocks_per_chunk
+                    load_start_gpu_block_idx // self.config.blocks_per_chunk
                 )
                 keys_to_load.extend(offload_keys[start_chunk_idx:num_chunks])
 
             dst_block_ids.extend(
                 block.block_id
-                for block in group_blocks[
-                    num_locally_computed_gpu_blocks:num_gpu_blocks
-                ]
+                for block in group_blocks[load_start_gpu_block_idx:num_gpu_blocks]
             )
             group_sizes.append(num_pending_gpu_blocks)
-            block_indices.append(num_locally_computed_gpu_blocks)
+            block_indices.append(load_start_gpu_block_idx)
 
             # Skip prefix-hit chunks for block-level policy; for
             # request-level, next_stored_chunk_idx stays at 0 so all
@@ -1054,7 +1195,10 @@ class OffloadingConnectorScheduler:
                 self.config.kv_group_configs, req_status.group_states
             ):
                 num_chunks = req_status.storable_chunks(
-                    group_config, group_state, num_offloadable_tokens
+                    group_config,
+                    group_state,
+                    num_offloadable_tokens,
+                    is_finished=req.is_finished(),
                 )
 
                 start_chunk_idx = group_state.next_stored_chunk_idx
@@ -1083,10 +1227,19 @@ class OffloadingConnectorScheduler:
                     # trailing chunks queried by _sliding_window_lookup are
                     # reachable. EAGLE/MTP requires one additional chunk that
                     # lookup later drops as its volatile draft tail.
+                    # The segment extent uses the known prompt length, not the
+                    # current storable count: with 1-chunk prefill steps every
+                    # chunk is momentarily trailing and the filter would pass
+                    # everything. Decode-born chunks (beyond the prompt) stay
+                    # trailing and dense as intended.
                     abs_chunk_idx = start_chunk_idx + key_idx
                     if not is_store_reachable_swa_chunk(
                         abs_chunk_idx,
-                        num_chunks,
+                        max(
+                            num_chunks,
+                            req_status.req.num_prompt_tokens
+                            // group_config.tokens_per_chunk,
+                        ),
                         group_config.alignment_chunk_count,
                         group_config.sliding_window_size_in_chunks,
                         group_config.is_eagle_group,

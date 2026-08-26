@@ -2080,6 +2080,112 @@ def test_swa_alignment_skip(request_runner, async_scheduling: bool):
 
 
 @pytest.mark.parametrize("async_scheduling", [True, False])
+def test_swa_checkpoint_stride(request_runner, async_scheduling: bool, monkeypatch):
+    """Explicit checkpoint stride sparsifies SWA stores on hybrid topologies
+    where every chunk is already a full-attention boundary candidate, so the
+    natural alignment derivation never engages (Qwen3.8-DFlash2-like: SWA
+    chunk size == FA chunk size). The stride env stores only the trailing
+    sw(+eagle) chunks of each stride-sized segment ("checkpoint band").
+
+    Setup (block_size=4, blocks_per_chunk=1, stride=4):
+      - Group 0: full attention, 16 tokens -> 4 chunks, all stored
+      - Group 1: SWA sliding_window=4 (1 chunk), eagle -> band width 2
+
+    With 16 tokens (4 SWA chunks): segment [0..3] stores trailing {2, 3}.
+    A revisit finds the band via backward sliding-window lookup (required
+    window = sw+1 = 2), pops the eagle extra, and loads only the window
+    chunks at the resulting boundary.
+    """
+    from vllm.distributed.kv_transfer.kv_connector.v1.offloading import (
+        scheduler as scheduler_module,
+    )
+
+    monkeypatch.setattr(scheduler_module, "_QWEN_OFFLOAD_CKPT_STRIDE", 4)
+
+    block_size = 4
+    kv_cache_groups = [
+        KVCacheGroupSpec(
+            ["layer0"],
+            FullAttentionSpec(
+                block_size=block_size,
+                num_kv_heads=1,
+                head_size=1,
+                dtype=torch.float32,
+            ),
+        ),
+        KVCacheGroupSpec(
+            ["layer1"],
+            SlidingWindowSpec(
+                block_size=block_size,
+                num_kv_heads=1,
+                head_size=1,
+                dtype=torch.float32,
+                sliding_window=block_size,
+            ),
+            is_eagle_group=True,
+        ),
+    ]
+
+    runner = request_runner(
+        block_size=block_size,
+        num_gpu_blocks=200,
+        async_scheduling=async_scheduling,
+        kv_cache_groups=kv_cache_groups,
+    )
+
+    kv_group_configs = runner.connector_scheduler.config.kv_group_configs
+    # Natural derivation would be None (4 <= 4); the explicit stride engages.
+    assert kv_group_configs[0].alignment_chunk_count is None
+    assert kv_group_configs[1].alignment_chunk_count == 4
+    assert kv_group_configs[1].sliding_window_size_in_chunks == 1
+
+    num_tokens = 16
+    runner.new_request(token_ids=[0] * num_tokens)
+    runner.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output(keys)
+    )
+    # complete_transfers=False: stores are only started here, so the
+    # prefill->decode transition lag cannot split completions across runs.
+    runner.run(decoded_tokens=[0], complete_transfers=False)
+
+    runner.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output(keys)
+    )
+    runner.run(
+        decoded_tokens=[EOS_TOKEN_ID],
+        # FA stores all 4 chunks; SWA stores only band {2, 3} within [0, 4)
+        expected_stored=(
+            (0, 0),
+            (0, 1),
+            (0, 2),
+            (0, 3),
+            (1, 2),
+            (1, 3),
+        ),
+    )
+
+    # Revisit: FA prefix fully hits; SWA backward lookup finds the band.
+    runner.scheduler.reset_prefix_cache()
+    runner.new_request(token_ids=[0] * num_tokens + [1])
+    runner.manager.lookup.return_value = LookupResult.HIT
+    runner.connector_scheduler._maximal_prefix_lookup = lambda keys, ctx, *_: 4
+    runner.run(
+        decoded_tokens=[EOS_TOKEN_ID],
+        # Boundary: SW -1 reduction clamps to 16 tokens (4 chunks); with the
+        # stride-gated eagle-pop suppression there is no further shave, so
+        # the full band is usable. FA loads prefix [0, 4); SWA loads its
+        # 1-chunk window at the boundary -- chunk 3, inside the band {2, 3}.
+        expected_loaded=(
+            (0, 0),
+            (0, 1),
+            (0, 2),
+            (0, 3),
+            (1, 3),
+        ),
+    )
+
+
+@pytest.mark.parametrize("async_scheduling", [True, False])
 def test_stale_sliding_window_block_after_prepare_store_failure(
     request_runner, async_scheduling: bool
 ):
@@ -2399,11 +2505,11 @@ class TestEagle:
         captured_keys: list = []
         orig_sw_lookup = type(sched)._sliding_window_lookup
 
-        def capturing_sw_lookup(self_arg, keys, window, req_context):
+        def capturing_sw_lookup(self_arg, keys, window, req_context, group_idx=-1):
             captured_keys.append(list(keys))
             return orig_sw_lookup(self_arg, keys, window, req_context)
 
-        sched._sliding_window_lookup = lambda keys, window, req_ctx: (
+        sched._sliding_window_lookup = lambda keys, window, req_ctx, group_idx=-1: (
             capturing_sw_lookup(sched, keys, window, req_ctx)
         )
 

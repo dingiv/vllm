@@ -14,7 +14,13 @@ from vllm.v1.core.kv_cache_coordinator import (
     get_kv_cache_coordinator,
 )
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
-from vllm.v1.core.kv_cache_utils import KVCacheBlock, KVCacheBlockCopy
+from vllm.v1.core.kv_cache_utils import (
+    KVCacheBlock,
+    KVCacheBlockCopy,
+    make_block_hash_with_group_id,
+)
+from vllm.v1.qwen_debug import OFFLOAD_PROBE as _QWEN_OFFLOAD_PROBE
+from vllm.v1.qwen_debug import logger as _PROBE_LOG
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     CrossAttentionSpec,
@@ -257,6 +263,29 @@ class KVCacheManager:
         # num_computed_tokens to be block-size aligned. Removing this limitation
         # could slightly improve performance in the future.
         max_cache_hit_length = request.num_tokens - 1
+        if _QWEN_OFFLOAD_PROBE:
+            _pg = self.coordinator.find_longest_cache_hit_per_group(
+                request.block_hashes, max_cache_hit_length
+            )
+            _req_hashes = getattr(request.block_hashes, "block_hashes", None)
+            _first = _req_hashes[0] if _req_hashes else None
+            _in_table = (
+                self.block_pool.cached_block_hash_to_block.get_one_block(
+                    make_block_hash_with_group_id(_first, 0)
+                )
+                is not None
+                if _first is not None
+                else None
+            )
+            _PROBE_LOG.info(
+                "[OFFPROBE] gpu-pool per-group hits req=%s groups=%s "
+                "hash_table_size=%d first_hash_in_g0=%s n_req_hashes=%d",
+                request.request_id[:10],
+                [int(h) for h in _pg[1]] if isinstance(_pg, tuple) else _pg,
+                len(self.block_pool.cached_block_hash_to_block),
+                _in_table,
+                len(_req_hashes) if _req_hashes else 0,
+            )
         computed_blocks, num_new_computed_tokens, num_uncached = (
             self.coordinator.find_longest_cache_hit(
                 request.block_hashes, max_cache_hit_length

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import functools
+import os
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -478,7 +479,14 @@ class CPUOffloadingWorker(OffloadingWorker):
     ):
         pin_memory = PIN_MEMORY
         logger.info("Allocating %d CPU tensors...", len(kv_caches.tensors))
-        if mmap_region is not None and pin_memory:
+        # LOCAL PATCH (2026-08-24, qwen38-27b project): cudaHostRegister on
+        # /dev/shm tmpfs mmap pages corrupts the CUDA context on consumer
+        # drivers (next CUDA op dies with "invalid argument"). Escape hatch:
+        # VLLM_KV_OFFLOAD_NO_PIN=1 skips registration; transfers fall back
+        # to unpinned DMA (slower but correct).
+        if os.environ.get("VLLM_KV_OFFLOAD_NO_PIN"):
+            logger.info("Skipping mmap host registration (VLLM_KV_OFFLOAD_NO_PIN)")
+        elif mmap_region is not None and pin_memory:
             pin_mmap_region(mmap_region)
 
         gpu_tensors: list[torch.Tensor] = []
