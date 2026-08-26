@@ -31,6 +31,8 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 from vllm.v1.request import Request
+import os as _os
+_SCHED_PROBE = _os.environ.get('QWEN_SCHED_PROBE', '0') == '1'
 
 
 class SingleTypeKVCacheManager(ABC):
@@ -730,13 +732,39 @@ class FullAttentionManager(SingleTypeKVCacheManager):
         )
         # Phase 1: longest run of cached full blocks from the start. A missing
         # block implies every later block misses too (chained hashes).
-        for block_hash in itertools.islice(full_block_hashes, max_length // block_size):
+        _fa_break_idx = -1  # TEMP 探针(波峰排查):链断点
+        _fa_break_hash = None
+        for _fa_idx, block_hash in enumerate(
+            itertools.islice(full_block_hashes, max_length // block_size)
+        ):
             cached_block = block_pool.get_cached_block(block_hash, kv_cache_group_ids)
             if not cached_block:
+                _fa_break_idx = _fa_idx
+                _fa_break_hash = block_hash
                 break
             for computed, cached in zip(computed_blocks, cached_block):
                 computed.append(cached)
         hit_length = len(computed_blocks[0]) * block_size
+        # TEMP 探针:断点详情(全组缺失 or 仅本组缺失)
+        if _SCHED_PROBE and _fa_break_idx >= 0 and block_size == 832:
+            # 任何组里存在该哈希?(raw hash 打全套组 id 探一遍)
+            _rh = (
+                _fa_break_hash.raw_hash if hasattr(_fa_break_hash, "raw_hash")
+                else _fa_break_hash
+            )
+            from vllm.v1.core.kv_cache_utils import make_block_hash_with_group_id
+            _any_group = any(
+                block_pool.cached_block_hash_to_block.get_one_block(
+                    make_block_hash_with_group_id(_rh, gid)
+                ) is not None
+                for gid in range(15)
+            )
+            print(
+                f"[FAHIT] walk={max_length // block_size} broke@{_fa_break_idx} "
+                f"hit={hit_length} hash_any_group={_any_group} "
+                f"h8={_rh[:6].hex() if isinstance(_rh, (bytes, bytearray)) else 'x'}",
+                flush=True,
+            )
 
         # Phase 2 (fine-grained only): extend into the first non-full block by
         # probing its interior hash boundaries high-to-low (longest hit first).
@@ -1315,6 +1343,7 @@ class MambaManager(SingleTypeKVCacheManager):
             max_num_partial_units = min(
                 max_length // hash_block_size, len(block_hashes)
             )
+            _probe_misses: list[int] = []  # TEMP 探针(波峰排查)
             for fine_idx in range(max_num_partial_units - 1, -1, -1):
                 num_tokens = (fine_idx + 1) * hash_block_size
                 block_hash = block_hashes[fine_idx]
@@ -1326,15 +1355,32 @@ class MambaManager(SingleTypeKVCacheManager):
                         computed.extend([block_pool.null_block] * block_idx)
                         computed.append(cached)
                     hit_length = num_tokens
+                    # TEMP 探针:找到的最深状态 + 顶部 miss 的边界索引
+                    if _SCHED_PROBE:
+                        print(
+                            f"[MAMBAHIT] found={fine_idx} "
+                            f"top_misses={_probe_misses[:5]} "
+                            f"pool_size={len(block_pool.cached_block_hash_to_block)}",
+                            flush=True,
+                        )
                     break
+                _probe_misses.append(fine_idx)
             return computed_blocks, hit_length
 
         max_num_blocks = max_length // block_size
         # Search from right to left and early stop when a match is found.
+        _cm_misses: list[int] = []  # TEMP 探针(波峰排查)
         for i in range(max_num_blocks - 1, -1, -1):
             if cached_block := block_pool.get_cached_block(
                 block_hashes[i], kv_cache_group_ids
             ):
+                if _SCHED_PROBE:
+                    print(
+                        f"[MAMBAHIT] coarse found={i} "
+                        f"top_misses={_cm_misses[:5]} "
+                        f"pool={len(block_pool.cached_block_hash_to_block)}",
+                        flush=True,
+                    )
                 # When enable Mamba prefix caching, `block_size` will be aligned
                 # across full attention layers and Mamba layers to ensure the
                 # prefix hit length aligned at block
@@ -1352,6 +1398,7 @@ class MambaManager(SingleTypeKVCacheManager):
                     computed.append(cached)
                 hit_length = (i + 1) * block_size
                 break  # we just need the last match - early stopping
+            _cm_misses.append(i)
 
         return computed_blocks, hit_length
 

@@ -25,6 +25,8 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowSpec,
 )
 from vllm.v1.request import Request
+import os as _os
+_SCHED_PROBE = _os.environ.get('QWEN_SCHED_PROBE', '0') == '1'
 
 
 def _validate_prefix_cache_retention_interval(
@@ -814,6 +816,27 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         cache_hit_blocks = tuple(
             blocks if blocks is not None else [] for blocks in hit_blocks_by_group
         )
+        # TEMP 探针(波峰排查,2026-08-26):分组级命中深度——
+        # 分辨"full-attn 块链断裂"vs"mamba 状态池丢状态"
+        if _SCHED_PROBE:
+            print(
+                "[GROUPHIT] max_len=%d final=%d uncached_common=%d | %s"
+                % (
+                    max_cache_hit_length,
+                    hit_length,
+                    num_uncached_common_prefix_tokens,
+                    " ".join(
+                        "g%d(%s)=%d" % (
+                            gid,
+                            type(self.kv_cache_config.kv_cache_groups[gid]
+                                 .kv_cache_spec).__name__[:12],
+                            hit_length_by_group[gid],
+                        )
+                        for gid in range(num_groups)
+                    ),
+                ),
+                flush=True,
+            )
         return cache_hit_blocks, hit_length, num_uncached_common_prefix_tokens
 
     def find_longest_cache_hit_per_group(

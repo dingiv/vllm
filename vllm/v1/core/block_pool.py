@@ -26,6 +26,8 @@ from vllm.v1.core.kv_cache_utils import (
     resolve_block_hashes,
 )
 from vllm.v1.request import Request
+import os as _os
+_SCHED_PROBE = _os.environ.get('QWEN_SCHED_PROBE', '0') == '1'
 
 logger = init_logger(__name__)
 
@@ -697,6 +699,19 @@ class BlockPool:
             return False
 
         self._emit_block_removed_events(evicted_hashes)
+        # TEMP 探针(波峰排查):驱逐现场——组 id + 哈希前缀
+        try:
+            from vllm.v1.core.kv_cache_utils import get_group_id, get_block_hash
+            if _SCHED_PROBE:
+                gids = sorted({get_group_id(h) for h in evicted_hashes})
+                print(
+                    f"[EVICT] block_id={block.block_id} n={len(evicted_hashes)} "
+                    f"gids={gids} h8="
+                    f"{[get_block_hash(h)[:6].hex() for h in list(evicted_hashes)[:3]]}",
+                    flush=True,
+                )
+        except Exception:
+            pass
         return True
 
     def touch(self, blocks: Sequence[KVCacheBlock]) -> None:

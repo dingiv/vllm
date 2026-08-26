@@ -38,6 +38,8 @@ from vllm.v1.core.encoder_cache_manager import (
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
+import os as _os
+_SCHED_PROBE = _os.environ.get('QWEN_SCHED_PROBE', '0') == '1'
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
 from vllm.v1.core.sched.output import (
     CachedRequestData,
@@ -770,6 +772,23 @@ class Scheduler(SchedulerInterface):
                             # Marconi shared-prefix junction to pin; 0 if none.
                             request.shared_prefix_boundary,
                         ) = self.kv_cache_manager.get_computed_blocks(request)
+                    # TEMP 探针(波峰排查,2026-08-26,默认关):
+                    # QWEN_SCHED_PROBE=1 时打印每请求命中深度+token 指纹
+                    if _SCHED_PROBE:
+                        import hashlib as _hl
+                        _toks = request.all_token_ids
+                        _win = []
+                        for _b in (40, 41, 42, 43, 44, 45, 46):
+                            _seg = repr(_toks[_b * 832:(_b + 1) * 832]).encode()
+                            _win.append(f"{_b}:{_hl.md5(_seg).hexdigest()[:6]}")
+                        print(
+                            f"[HITPROBE] req={request.request_id[:12]} "
+                            f"prompt_tok={request.num_prompt_tokens} "
+                            f"hit_tok={num_new_local_computed_tokens} "
+                            f"shared_boundary={request.shared_prefix_boundary} "
+                            f"tokwin=[{' '.join(_win)}]",
+                            flush=True,
+                        )
 
                     # Get externally-cached tokens if using a KVConnector.
                     if self.connector is not None:
