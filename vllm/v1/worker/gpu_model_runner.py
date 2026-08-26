@@ -3871,6 +3871,17 @@ class GPUModelRunner(
         # This is required in the async scheduling case because
         # the CPU->GPU transfer happens async.
         self.prepare_inputs_event.synchronize()
+        # club-3090 GDN+MTP async spec-order fix (their #1052 / upstream
+        # #52873 + PR#50021 thread): prepare_inputs_event is recorded BEFORE
+        # the forward + spec-decode fused-align postprocess, so under async
+        # scheduling the next step's _update_states block-table mutation raced
+        # the still-in-flight postprocess -> stale state-block index -> wild
+        # GPU write (Xid 31 VIRT_WRITE). Wait the postprocess event to close
+        # the write-after-read window. Scoped to spec decode (event None
+        # otherwise); an unrecorded event is complete, so the first step is
+        # unaffected.
+        if self.num_accepted_tokens_event is not None:
+            self.num_accepted_tokens_event.synchronize()
         try:
             yield
         finally:
