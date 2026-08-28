@@ -18,6 +18,7 @@ File naming:  <base_path>_r<rank>/<hhh>/<hh>_g<group_idx>/<hash_hex>.bin
 import functools
 import json
 import os
+from pathlib import Path
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, ClassVar
 
@@ -116,6 +117,7 @@ class FileSystemTierManager(SecondaryTierManager):
         n_write_threads: int = 16,
         enable_kv_events: bool = False,
         locality: str | None = None,
+        max_kv_bytes: int = 0,
     ):
         """
         Args:
@@ -192,6 +194,73 @@ class FileSystemTierManager(SecondaryTierManager):
 
         self._lookup_manager = FsAsyncLookupManager(tier=self, tier_type=self.tier_type)
 
+        # LOCAL (qwen38 project): capacity cap with chunk-granular LRU eviction.
+        # 0 = unlimited (upstream behavior). Accounts bytes actually written;
+        # when a store would exceed the cap, the oldest chunks (by file mtime,
+        # evicted whole -- all group files sharing one chunk hash) are deleted.
+        self._max_kv_bytes = int(max_kv_bytes or 0)
+        self._used_kv_bytes = 0
+        if self._max_kv_bytes:
+            self._recount_existing_bytes()
+            logger.info(
+                "fs tier quota: max=%d bytes, existing usage=%d bytes",
+                self._max_kv_bytes, self._used_kv_bytes,
+            )
+
+    def _recount_existing_bytes(self) -> None:
+        """Scan root_dir for pre-existing block files (restart recovery) and
+        seed the usage counter. Files left by a previous engine instance are
+        still valid: keys are content hashes, so lookup finds them."""
+        import glob as _glob
+        total = 0
+        for path_str in _glob.glob(self.file_mapper.base_path + "_r*/**/*.bin",
+                                   recursive=True):
+            path = Path(path_str)
+            try:
+                total += path.stat().st_size
+            except OSError:
+                continue
+        self._used_kv_bytes = total
+
+    def _evict_until_under_cap(self, incoming_bytes: int) -> None:
+        """Delete oldest chunk-groups (by mtime) until
+        used - evicted + incoming <= max. Whole-chunk eviction: all group
+        files sharing one chunk hash go together (band coherence)."""
+        if not self._max_kv_bytes:
+            return
+        budget = self._max_kv_bytes - incoming_bytes
+        if self._used_kv_bytes <= budget:
+            return
+        import glob as _glob
+        groups: dict[str, list] = {}
+        for path_str in _glob.glob(self.file_mapper.base_path + "_r*/**/*.bin",
+                                   recursive=True):
+            path = Path(path_str)
+            try:
+                st = path.stat()
+            except OSError:
+                continue
+            chunk_key = path.stem  # hash hex; same chunk shares stem across groups
+            groups.setdefault(chunk_key, []).append((path, st.st_size, st.st_mtime))
+        chunks_by_age = sorted(
+            groups.items(),
+            key=lambda kv: min(t for _, _, t in kv[1]),
+        )
+        for chunk_key, files in chunks_by_age:
+            if self._used_kv_bytes <= budget:
+                break
+            chunk_bytes = sum(sz for _, sz, _ in files)
+            for f, _, _ in files:
+                try:
+                    f.unlink()
+                except OSError:
+                    pass
+            self._used_kv_bytes -= chunk_bytes
+        logger.info(
+            "fs tier eviction: usage now %d / %d bytes",
+            self._used_kv_bytes, self._max_kv_bytes,
+        )
+
     @override
     def on_new_request(self, req_context: ReqContext) -> RequestOffloadingContext:
         return RequestOffloadingContext()
@@ -205,6 +274,12 @@ class FileSystemTierManager(SecondaryTierManager):
 
     @override
     def submit_store(self, job_metadata: JobMetadata) -> None:
+        if self._max_kv_bytes:
+            # Pre-evict based on bytes about to be written (block_size per key;
+            # actual written size equals block_size -- full-block DMA).
+            self._evict_until_under_cap(
+                self._block_size * len(job_metadata.block_ids)
+            )
         if self.events is not None:
             self._store_job_keys[job_metadata.job_id] = list(job_metadata.keys)
         task = functools.partial(
@@ -237,6 +312,8 @@ class FileSystemTierManager(SecondaryTierManager):
         """
         results = []
         for job_id, success in self._pool.get_finished():
+            if success and self._max_kv_bytes:
+                self._used_kv_bytes += self._block_size
             if self.events is not None:
                 keys = self._store_job_keys.pop(job_id, None)
                 if success and keys:
