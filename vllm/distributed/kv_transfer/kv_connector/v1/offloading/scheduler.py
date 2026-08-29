@@ -976,6 +976,16 @@ class OffloadingConnectorScheduler:
             lookup_start = time.monotonic()
             num_hit_tokens = self._lookup(req_status)
             if _QWEN_OFFLOAD_PROBE:
+                if num_hit_tokens is None:
+                    _defer_cnt = getattr(req_status, "_qwen_defer_cnt", 0) + 1
+                    setattr(req_status, "_qwen_defer_cnt", _defer_cnt)
+                    if _defer_cnt % 20 == 1:
+                        logger.info(
+                            "[QKV] lookup DEFER req=%s cnt=%d(每步重试,若持续增长=晋升未完成)",
+                            request.request_id[:10], _defer_cnt,
+                        )
+                else:
+                    setattr(req_status, "_qwen_defer_cnt", 0)
                 _keys_per_group = [
                     len(gs.offload_keys) for gs in req_status.group_states
                 ]

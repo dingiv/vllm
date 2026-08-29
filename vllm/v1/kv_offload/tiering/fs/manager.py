@@ -41,6 +41,8 @@ from vllm.v1.kv_offload.base import (
     ReqContext,
 )
 from vllm.v1.kv_offload.file_mapper import FileMapper
+from vllm.v1.qwen_debug import qwen_debug_log, OFFLOAD_PROBE
+
 from vllm.v1.kv_offload.tiering.async_lookup import AsyncLookupManager
 from vllm.v1.kv_offload.tiering.base import (
     JobId,
@@ -77,11 +79,23 @@ class FsAsyncLookupManager(AsyncLookupManager):
     def batch_lookup(
         self, keys: list[OffloadKey], req_context: ReqContext
     ) -> Iterable[bool]:
+        import time as _time
+        _t0 = _time.monotonic() if OFFLOAD_PROBE else 0.0
         paths = [self._tier.file_mapper.get_file_name(k) for k in keys]
         if _HAS_BATCH_LOOKUP_C:
             # C extension: GIL released for the entire faccessat() batch.
-            return batch_lookup_C(paths)
-        return (os.path.exists(p) for p in paths)
+            _r = list(batch_lookup_C(paths))
+        else:
+            _r = list(os.path.exists(p) for p in paths)
+        if OFFLOAD_PROBE:
+            _ms = (_time.monotonic() - _t0) * 1000
+            if _ms > 100:
+                qwen_debug_log(
+                    "offload",
+                    "[QKV] fs.batch_lookup SLOW keys=%d %.1fms hits=%d",
+                    len(keys), _ms, sum(1 for x in _r if x),
+                )
+        return iter(_r)
 
 
 class FileSystemTierManager(SecondaryTierManager):
@@ -256,6 +270,11 @@ class FileSystemTierManager(SecondaryTierManager):
                 except OSError:
                     pass
             self._used_kv_bytes -= chunk_bytes
+        qwen_debug_log(
+            "offload",
+            "[QKV] fs.evict: usage now %d / %d bytes",
+            self._used_kv_bytes, self._max_kv_bytes,
+        )
         logger.info(
             "fs tier eviction: usage now %d / %d bytes",
             self._used_kv_bytes, self._max_kv_bytes,
@@ -274,6 +293,13 @@ class FileSystemTierManager(SecondaryTierManager):
 
     @override
     def submit_store(self, job_metadata: JobMetadata) -> None:
+        qwen_debug_log(
+            "offload",
+            "[QKV] fs.submit_store blocks=%d used=%d/%s",
+            len(job_metadata.block_ids),
+            self._used_kv_bytes,
+            self._max_kv_bytes or "inf",
+        )
         if self._max_kv_bytes:
             # Pre-evict based on bytes about to be written (block_size per key;
             # actual written size equals block_size -- full-block DMA).

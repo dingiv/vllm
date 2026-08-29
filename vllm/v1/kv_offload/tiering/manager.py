@@ -31,6 +31,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
     OffloadingConnectorStats,
 )
 from vllm.logger import init_logger
+from vllm.v1.qwen_debug import qwen_debug_log
+from vllm.v1.qwen_debug import OFFLOAD_PROBE
+
 from vllm.v1.kv_offload.base import (
     LoadStoreSpec,
     LookupResult,
@@ -254,6 +257,9 @@ class TieringOffloadingManager(OffloadingManager):
         3. For completed loads (secondary→primary): calls primary.complete_write()
            to make blocks available
         """
+        if OFFLOAD_PROBE:
+            import time as _time
+            _t0 = _time.monotonic()
         for i, tier in enumerate(self.secondary_tiers):
             for completed_job in tier.get_finished_jobs():
                 job_id = completed_job.job_id
@@ -277,6 +283,14 @@ class TieringOffloadingManager(OffloadingManager):
                     self.primary_tier.complete_read(
                         job_metadata.keys, job_metadata.req_context
                     )
+        if OFFLOAD_PROBE:
+            _ms = (_time.monotonic() - _t0) * 1000
+            if _ms > 200:
+                qwen_debug_log(
+                    "offload",
+                    "[QKV] tiering.process_finished_jobs SLOW %.1fms",
+                    _ms,
+                )
 
     @override
     def lookup(
@@ -314,6 +328,7 @@ class TieringOffloadingManager(OffloadingManager):
         self._maybe_process_finished_jobs()
 
         req_state = self._req_state.get(req_context.req_id)
+        _t0 = time.monotonic() if OFFLOAD_PROBE else 0.0
 
         primary_hit = self.primary_tier.lookup(key, req_context)
         if primary_hit is LookupResult.HIT:
@@ -343,6 +358,16 @@ class TieringOffloadingManager(OffloadingManager):
                 any_retry = True
 
         self._accumulate_lookup_sync_delay(req_state, lookup_start)
+        if OFFLOAD_PROBE and req_state is not None:
+            _dur_ms = (time.monotonic() - _t0) * 1000
+            if _dur_ms > 50:
+                qwen_debug_log(
+                    "offload",
+                    "[QKV] tiering.lookup SLOW req=%s key=%s... %.1fms",
+                    req_context.req_id[:10],
+                    bytes(key).hex()[:10] if isinstance(key, bytes) else str(key)[:10],
+                    _dur_ms,
+                )
         if any_retry:
             if req_state is not None and req_state.secondary_lookup_start_time is None:
                 req_state.secondary_lookup_start_time = lookup_start
@@ -407,6 +432,11 @@ class TieringOffloadingManager(OffloadingManager):
         primary_write_result = self.primary_tier.prepare_write([key], req_context)
 
         if primary_write_result is None:
+            qwen_debug_log(
+                "offload",
+                "[QKV] promotion rejected: primary tier full key=%s...",
+                bytes(key).hex()[:10] if isinstance(key, bytes) else str(key)[:10],
+            )
             # Primary tier is full; caller should treat the block as unavailable
             # rather than retrying indefinitely.
             return False
@@ -446,6 +476,13 @@ class TieringOffloadingManager(OffloadingManager):
                     req_context=entry.req_context,
                 )
                 self._transfer_jobs[job_id] = job_metadata
+                qwen_debug_log(
+                    "offload",
+                    "[QKV] promote submit req=%s tier=%s blocks=%d",
+                    entry.req_context.req_id[:10],
+                    getattr(tier, "tier_type", "?"),
+                    len(entry.keys),
+                )
                 tier.submit_load(job_metadata)
 
         self._pending_load_submissions.clear()
