@@ -781,3 +781,90 @@ def test_fs_tier_cross_tp_round_trip(tmp_path):
         assert torch.allclose(reader_tensor[1], expected)
     finally:
         reader.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# Capacity quota (LOCAL): root-wide accounting, index-based LRU eviction
+# ---------------------------------------------------------------------------
+
+
+def _write_block_file(root, base, rank, group, stem, size, mtime):
+    d = root / f"{base}_r{rank}" / stem[:3] / f"{stem[3:5]}_g{group}"
+    d.mkdir(parents=True, exist_ok=True)
+    p = d / f"{stem}.bin"
+    p.write_bytes(b"\0" * size)
+    os.utime(p, (mtime, mtime))
+    return p
+
+
+def _make_quota_tier(tmp_path, max_kv_bytes):
+    tensor = _page_aligned_zero_tensor(_NUM_BLOCKS, _BLOCK_ELEMENTS)
+    tier = FileSystemTierManager(
+        offloading_spec=_MOCK_OFFLOADING_SPEC,
+        primary_kv_view=memoryview(tensor.numpy()),
+        tier_type="fs",
+        root_dir=str(tmp_path),
+        n_read_threads=2,
+        n_write_threads=2,
+        max_kv_bytes=max_kv_bytes,
+    )
+    return tier
+
+
+def test_quota_counts_all_bases_and_ranks(tmp_path):
+    _write_block_file(tmp_path, "base_a", 0, 0, "aaaa" + "0" * 60, 10, 1000)
+    _write_block_file(tmp_path, "base_a", 1, 0, "aaaa" + "0" * 60, 10, 1000)
+    _write_block_file(tmp_path, "base_b", 0, 3, "bbbb" + "0" * 60, 7, 2000)
+    tier = _make_quota_tier(tmp_path, max_kv_bytes=1000)
+    try:
+        assert tier._used_kv_bytes == 27
+        assert len(tier._chunk_index) == 2
+    finally:
+        tier.shutdown()
+
+
+def test_eviction_oldest_whole_chunk_and_prunes_dirs(tmp_path):
+    old_stem, new_stem = "aaaa" + "0" * 60, "bbbb" + "0" * 60
+    for rank in (0, 1):
+        _write_block_file(tmp_path, "base_a", rank, 0, old_stem, 10, 1000)
+        _write_block_file(tmp_path, "base_a", rank, 0, new_stem, 10, 5000)
+    tier = _make_quota_tier(tmp_path, max_kv_bytes=30)
+    try:
+        assert tier._used_kv_bytes == 40
+        tier._evict_until_under_cap(incoming_bytes=5)
+        assert tier._used_kv_bytes == 20
+        assert old_stem not in tier._chunk_index
+        assert new_stem in tier._chunk_index
+        young = list(tmp_path.rglob(f"{new_stem}.bin"))
+        assert len(young) == 2
+        assert not list(tmp_path.rglob(f"{old_stem}.bin"))
+        assert not list(tmp_path.rglob("aaa/a0_g0"))
+    finally:
+        tier.shutdown()
+
+
+def test_oversize_job_skips_eviction(tmp_path):
+    stem = "aaaa" + "0" * 60
+    _write_block_file(tmp_path, "base_a", 0, 0, stem, 10, 1000)
+    tier = _make_quota_tier(tmp_path, max_kv_bytes=100)
+    try:
+        assert tier._used_kv_bytes == 10
+        tier._evict_until_under_cap(incoming_bytes=200)
+        assert tier._used_kv_bytes == 10
+        assert list(tmp_path.rglob(f"{stem}.bin"))
+    finally:
+        tier.shutdown()
+
+
+def test_eviction_rescans_tree_when_index_dry(tmp_path):
+    stem = "cccc" + "0" * 60
+    tier = _make_quota_tier(tmp_path, max_kv_bytes=15)
+    try:
+        assert tier._used_kv_bytes == 0
+        _write_block_file(tmp_path, "base_a", 0, 0, stem, 10, 1000)
+        tier._used_kv_bytes = 12  # counter advanced by store success; index empty
+        tier._evict_until_under_cap(incoming_bytes=10)
+        assert tier._used_kv_bytes == 0
+        assert not list(tmp_path.rglob(f"{stem}.bin"))
+    finally:
+        tier.shutdown()

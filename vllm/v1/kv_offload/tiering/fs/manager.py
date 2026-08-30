@@ -18,6 +18,7 @@ File naming:  <base_path>_r<rank>/<hhh>/<hh>_g<group_idx>/<hash_hex>.bin
 import functools
 import json
 import os
+import time
 from pathlib import Path
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, ClassVar
@@ -209,75 +210,141 @@ class FileSystemTierManager(SecondaryTierManager):
         self._lookup_manager = FsAsyncLookupManager(tier=self, tier_type=self.tier_type)
 
         # LOCAL (qwen38 project): capacity cap with chunk-granular LRU eviction.
-        # 0 = unlimited (upstream behavior). Accounts bytes actually written;
-        # when a store would exceed the cap, the oldest chunks (by file mtime,
-        # evicted whole -- all group files sharing one chunk hash) are deleted.
+        # 0 = unlimited (upstream behavior). Scope is the WHOLE root_dir (all
+        # base-digest dirs and ranks), not just this spec's base_path, so
+        # orphaned data from older engine configs still counts and gets
+        # evicted. A startup scan seeds an in-memory chunk index; eviction
+        # walks that index (O(need)) and only rescans the tree when the index
+        # runs dry.
         self._max_kv_bytes = int(max_kv_bytes or 0)
         self._used_kv_bytes = 0
+        self._root = Path(root_dir)
+        self._chunk_index: dict[str, list] = {}
+        self._evict_blocked: set[str] = set()
+        self._oversize_warned = False
+        self._last_evict_log = 0.0
         if self._max_kv_bytes:
             self._recount_existing_bytes()
             logger.info(
-                "fs tier quota: max=%d bytes, existing usage=%d bytes",
-                self._max_kv_bytes, self._used_kv_bytes,
+                "fs tier quota: max=%d bytes, existing usage=%d bytes "
+                "(scope=%s)",
+                self._max_kv_bytes, self._used_kv_bytes, self._root,
             )
 
-    def _recount_existing_bytes(self) -> None:
-        """Scan root_dir for pre-existing block files (restart recovery) and
-        seed the usage counter. Files left by a previous engine instance are
-        still valid: keys are content hashes, so lookup finds them."""
-        import glob as _glob
-        total = 0
-        for path_str in _glob.glob(self.file_mapper.base_path + "_r*/**/*.bin",
-                                   recursive=True):
-            path = Path(path_str)
-            try:
-                total += path.stat().st_size
-            except OSError:
-                continue
-        self._used_kv_bytes = total
+    def _iter_block_files(self) -> Iterable[str]:
+        """All block files under root_dir, any base digest, any rank.
 
-    def _evict_until_under_cap(self, incoming_bytes: int) -> None:
-        """Delete oldest chunk-groups (by mtime) until
-        used - evicted + incoming <= max. Whole-chunk eviction: all group
-        files sharing one chunk hash go together (band coherence)."""
-        if not self._max_kv_bytes:
-            return
-        budget = self._max_kv_bytes - incoming_bytes
-        if self._used_kv_bytes <= budget:
-            return
+        Layout is fixed by FileMapper.get_file_name:
+        <root>/<base>_r<rank>/<hhh>/<hh>_g<group>/<hash>.bin
+        """
         import glob as _glob
-        groups: dict[str, list] = {}
-        for path_str in _glob.glob(self.file_mapper.base_path + "_r*/**/*.bin",
-                                   recursive=True):
+        return _glob.glob(
+            os.path.join(str(self._root), "*_r[0-9]", "*", "*_g*", "*.bin")
+        )
+
+    def _recount_existing_bytes(self) -> None:
+        """Scan root_dir for pre-existing block files (restart recovery),
+        rebuild the chunk index and resync the usage counter with disk.
+        Files left by a previous engine instance are still valid: keys are
+        content hashes, so lookup finds them."""
+        index: dict[str, list] = {}
+        total = 0
+        for path_str in self._iter_block_files():
             path = Path(path_str)
             try:
                 st = path.stat()
             except OSError:
                 continue
-            chunk_key = path.stem  # hash hex; same chunk shares stem across groups
-            groups.setdefault(chunk_key, []).append((path, st.st_size, st.st_mtime))
-        chunks_by_age = sorted(
-            groups.items(),
-            key=lambda kv: min(t for _, _, t in kv[1]),
-        )
-        for chunk_key, files in chunks_by_age:
-            if self._used_kv_bytes <= budget:
-                break
+            total += st.st_size
+            index.setdefault(path.stem, []).append((path, st.st_size, st.st_mtime))
+        self._chunk_index = index
+        self._evict_blocked.clear()
+        self._used_kv_bytes = total
+
+    def _evict_oldest_chunks(self, need_bytes: int) -> int:
+        """Delete oldest chunks (min mtime across the chunk's group files)
+        until at least need_bytes are freed or nothing evictable remains.
+        Whole-chunk eviction: all group/rank files sharing one chunk hash go
+        together (band coherence)."""
+        freed = 0
+        while freed < need_bytes:
+            candidates = [
+                (key, files)
+                for key, files in self._chunk_index.items()
+                if key not in self._evict_blocked
+            ]
+            if not candidates:
+                self._recount_existing_bytes()
+                candidates = [
+                    (key, files)
+                    for key, files in self._chunk_index.items()
+                    if key not in self._evict_blocked
+                ]
+                if not candidates:
+                    break
+            key, files = min(
+                candidates, key=lambda kv: min(t for _, _, t in kv[1])
+            )
             chunk_bytes = sum(sz for _, sz, _ in files)
+            removed = True
             for f, _, _ in files:
                 try:
                     f.unlink()
                 except OSError:
-                    pass
+                    removed = False
+                    break
+            if not removed:
+                self._evict_blocked.add(key)
+                continue
+            self._prune_empty_dirs(files)
+            self._chunk_index.pop(key, None)
             self._used_kv_bytes -= chunk_bytes
+            freed += chunk_bytes
+        return freed
+
+    def _prune_empty_dirs(self, files: list) -> None:
+        """Remove now-empty hash/group dirs left behind by eviction,
+        stopping at the tier root."""
+        seen: set = set()
+        for f, _, _ in files:
+            d = f.parent
+            while d != self._root and d not in seen:
+                seen.add(d)
+                try:
+                    d.rmdir()
+                except OSError:
+                    break
+                d = d.parent
+
+    def _evict_until_under_cap(self, incoming_bytes: int) -> None:
+        """Ensure used - evicted + incoming <= max, deleting oldest chunks."""
+        if not self._max_kv_bytes:
+            return
+        if incoming_bytes > self._max_kv_bytes:
+            if not self._oversize_warned:
+                logger.warning(
+                    "fs tier: single store job (%d bytes) exceeds quota "
+                    "(%d bytes); letting it through unbounded",
+                    incoming_bytes, self._max_kv_bytes,
+                )
+                self._oversize_warned = True
+            return
+        budget = self._max_kv_bytes - incoming_bytes
+        if self._used_kv_bytes <= budget:
+            return
+        need = self._used_kv_bytes - budget
+        freed = self._evict_oldest_chunks(need)
+        now = time.monotonic()
+        if now - self._last_evict_log >= 30.0:
+            self._last_evict_log = now
+            logger.warning(
+                "fs tier eviction: freed %d bytes (need %d), usage now %d / %d",
+                freed, need, self._used_kv_bytes, self._max_kv_bytes,
+            )
         qwen_debug_log(
             "offload",
-            "[QKV] fs.evict: usage now %d / %d bytes",
-            self._used_kv_bytes, self._max_kv_bytes,
-        )
-        logger.info(
-            "fs tier eviction: usage now %d / %d bytes",
-            self._used_kv_bytes, self._max_kv_bytes,
+            "[QKV] fs.evict freed=%d usage=%d/%d",
+            freed, self._used_kv_bytes, self._max_kv_bytes,
         )
 
     @override
