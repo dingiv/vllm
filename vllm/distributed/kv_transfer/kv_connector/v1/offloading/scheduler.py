@@ -63,6 +63,9 @@ logger = init_logger(__name__)
 # or the legacy QWEN_OFFLOAD_PROBE=1 alias).
 from vllm.v1.qwen_debug import OFFLOAD_PROBE as _QWEN_OFFLOAD_PROBE
 
+# [QKV] lookup DEFER 计数(req_id -> 重试次数;有界防泄漏)
+_QWEN_DEFER_CNTS: dict[str, int] = {}
+
 # LOCAL (2026-08-27, qwen38 project): checkpoint-stride sparsification for
 # recurrent / SWA groups. On hybrid-GDN topologies (Qwen3.8-DFlash2) every
 # group's chunk boundary is a valid full-attention boundary, so the natural
@@ -976,16 +979,20 @@ class OffloadingConnectorScheduler:
             lookup_start = time.monotonic()
             num_hit_tokens = self._lookup(req_status)
             if _QWEN_OFFLOAD_PROBE:
+                # DEFER 计数放模块级有界字典——RequestOffloadState 是
+                # slots=True 的 dataclass,挂不住任意属性(挂了即崩)
                 if num_hit_tokens is None:
-                    _defer_cnt = getattr(req_status, "_qwen_defer_cnt", 0) + 1
-                    setattr(req_status, "_qwen_defer_cnt", _defer_cnt)
+                    _defer_cnt = _QWEN_DEFER_CNTS.get(request.request_id, 0) + 1
+                    if len(_QWEN_DEFER_CNTS) > 4096:
+                        _QWEN_DEFER_CNTS.clear()
+                    _QWEN_DEFER_CNTS[request.request_id] = _defer_cnt
                     if _defer_cnt % 20 == 1:
                         logger.info(
                             "[QKV] lookup DEFER req=%s cnt=%d(每步重试,若持续增长=晋升未完成)",
                             request.request_id[:10], _defer_cnt,
                         )
                 else:
-                    setattr(req_status, "_qwen_defer_cnt", 0)
+                    _QWEN_DEFER_CNTS.pop(request.request_id, None)
                 _keys_per_group = [
                     len(gs.offload_keys) for gs in req_status.group_states
                 ]
