@@ -319,13 +319,12 @@ class CPUOffloadingManager(OffloadingManager):
     def get_stats(self) -> OffloadingConnectorStats | None:
         stats = OffloadingConnectorStats()
 
-        # Compute cache usage.
-        num_used = (
-            self._num_allocated_blocks
-            - len(self._free_list)
-            - self._num_evictable_cache_blocks
-        )
-        usage = num_used / self._num_blocks if self._num_blocks > 0 else 0.0
+        # Cache occupancy: allocated (stored, incl. evictable) blocks over
+        # capacity. The old formula subtracted evictable blocks, reporting
+        # only in-flight pressure — a completely full tier read as 0.0 and
+        # hid saturation from operators.
+        num_stored = self._num_allocated_blocks - len(self._free_list)
+        usage = num_stored / self._num_blocks if self._num_blocks > 0 else 0.0
         stats.set_gauge(CPUOffloadingMetrics.CPU_CACHE_USAGE_PERC, usage)
 
         for allocation_size in self.allocation_sizes_in_current_batch:
@@ -339,7 +338,15 @@ class CPUOffloadingManager(OffloadingManager):
             if self._num_blocks > 0
             else 0.0
         )
-        read_usage = max(usage - write_usage, 0.0)
+        # Read pressure = in-flight reads = busy blocks minus write pins.
+        # (busy = non-evictable: write-pending or read-pinned)
+        num_busy = (
+            self._num_allocated_blocks
+            - len(self._free_list)
+            - self._num_evictable_cache_blocks
+        )
+        busy_usage = num_busy / self._num_blocks if self._num_blocks > 0 else 0.0
+        read_usage = max(busy_usage - write_usage, 0.0)
         stats.set_gauge(CPUOffloadingMetrics.CPU_CACHE_WRITE_USAGE_PERC, write_usage)
         stats.set_gauge(CPUOffloadingMetrics.CPU_CACHE_READ_USAGE_PERC, read_usage)
 

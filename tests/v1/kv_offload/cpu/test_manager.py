@@ -250,15 +250,13 @@ def test_cpu_manager_reports_cache_usage_gauge():
     manager.prepare_store(to_keys([3, 4]), _EMPTY_REQ_CTX)
     check_usage_stats(manager, 1.0)
 
-    # After completing store, the blocks becomes evictable as it is not actively used
-    # and usage drops.
+    # After completing store, the blocks become evictable but remain STORED:
+    # the gauge reports occupancy, which must not drop.
     manager.complete_store(to_keys([1, 2]), _EMPTY_REQ_CTX)
-    check_usage_stats(manager, 0.5)
+    check_usage_stats(manager, 1.0)
 
-    # After completing store, the blocks becomes evictable as it is not actively used
-    # and usage drops.
     manager.complete_store(to_keys([3, 4]), _EMPTY_REQ_CTX)
-    check_usage_stats(manager, 0.0)
+    check_usage_stats(manager, 1.0)
 
 
 def test_cpu_manager_reports_allocation_size_histogram():
@@ -327,20 +325,23 @@ def test_cpu_manager_reports_cache_write_and_read_usage_gauges():
     check_split_usage_stats(manager, write=0.5, read=0.0, total=0.5)
 
     manager.complete_store(to_keys([1, 2]), _EMPTY_REQ_CTX)
-    check_split_usage_stats(manager, write=0.0, read=0.0, total=0.0)
+    # write pressure released; blocks remain stored -> occupancy stays 0.5
+    check_split_usage_stats(manager, write=0.0, read=0.0, total=0.5)
 
     # Load path: pins read usage until complete_load.
     assert manager.lookup(to_key(1), _EMPTY_REQ_CTX) is LookupResult.HIT
     manager.prepare_load(to_keys([1]), _EMPTY_REQ_CTX)
-    check_split_usage_stats(manager, write=0.0, read=0.25, total=0.25)
+    check_split_usage_stats(manager, write=0.0, read=0.25, total=0.5)
 
     manager.complete_load(to_keys([1]), _EMPTY_REQ_CTX)
-    check_split_usage_stats(manager, write=0.0, read=0.0, total=0.0)
+    # read pressure released; occupancy unchanged
+    check_split_usage_stats(manager, write=0.0, read=0.0, total=0.5)
 
-    # Concurrent write + read pins are both reflected and additive.
+    # Concurrent write + read pins are both reflected and additive;
+    # total remains occupancy (all 4 blocks stored).
     manager.prepare_store(to_keys([3, 4]), _EMPTY_REQ_CTX)
     manager.prepare_load(to_keys([2]), _EMPTY_REQ_CTX)
-    check_split_usage_stats(manager, write=0.5, read=0.25, total=0.75)
+    check_split_usage_stats(manager, write=0.5, read=0.25, total=1.0)
 
 
 def test_cpu_manager_clears_write_usage_after_failed_store():
