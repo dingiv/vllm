@@ -592,3 +592,30 @@ class TestRenderEmbedPrompt:
         assert len(results[0]["prompt_token_ids"]) == len(text_input)
         # Second should be embed prompt
         assert torch.equal(results[1]["prompt_embeds"], tensor_input)
+
+
+def test_oversized_output_budget_is_clamped_not_rejected():
+    """Prompt fitting max_total but eating into max_output must pass.
+
+    The serving layer (get_max_tokens) clamps the output budget to
+    max_model_len - input_length; the renderer must not reject earlier
+    (opencode `compact` sends a fixed 32000 output budget).
+    """
+    renderer = _build_renderer(MockModelConfig())
+
+    # max_input = 100 - 50 = 50; 80 tokens: > max_input, <= max_total
+    prompts = renderer.tokenize_prompts(
+        _preprocess_prompt(renderer.model_config, list(range(80))),
+        TokenizeParams(max_total_tokens=100, max_output_tokens=50),
+    )
+    assert len(prompts[0]["prompt_token_ids"]) == 80
+
+
+def test_prompt_alone_over_max_total_still_rejected():
+    renderer = _build_renderer(MockModelConfig())
+
+    with pytest.raises(VLLMValidationError, match="maximum context length"):
+        renderer.tokenize_prompts(
+            _preprocess_prompt(renderer.model_config, list(range(120))),
+            TokenizeParams(max_total_tokens=100, max_output_tokens=50),
+        )

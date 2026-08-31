@@ -446,16 +446,30 @@ class TokenizeParams:
             # actual prompt length could be larger.
             qualifier = "at least " if token_count == max_input_tokens + 1 else ""
             total = token_count + self.max_output_tokens
-            raise VLLMValidationError(
-                f"This model's maximum context length is "
-                f"{self.max_total_tokens} tokens. However, you requested "
-                f"{self.max_output_tokens} output tokens and your prompt "
-                f"contains {qualifier}{token_count} input tokens, "
-                f"for a total of {qualifier}{total} tokens. "
-                f"Please reduce the length of the input prompt or the "
-                f"number of requested output tokens.",
-                parameter="input_tokens",
-                value=token_count,
+            # LOCAL (qwen38, 2026-08-31): only reject when the PROMPT alone
+            # cannot fit. A prompt that fits but eats into max_output_tokens
+            # is handled downstream: get_max_tokens() clamps the output
+            # budget to max_model_len - input_length. The old unconditional
+            # raise here killed e.g. opencode's `compact` (fixed 32000
+            # output budget) whenever the client's token estimate ran 1
+            # under the server's count.
+            if token_count > self.max_total_tokens:
+                raise VLLMValidationError(
+                    f"This model's maximum context length is "
+                    f"{self.max_total_tokens} tokens. However, you requested "
+                    f"{self.max_output_tokens} output tokens and your prompt "
+                    f"contains {qualifier}{token_count} input tokens, "
+                    f"for a total of {qualifier}{total} tokens. "
+                    f"Please reduce the length of the input prompt or the "
+                    f"number of requested output tokens.",
+                    parameter="input_tokens",
+                    value=token_count,
+                )
+            logger.info(
+                "Prompt uses %d/%d tokens, leaving %d for output but "
+                "%d requested; clamping output budget downstream.",
+                token_count, self.max_total_tokens,
+                self.max_total_tokens - token_count, self.max_output_tokens,
             )
 
         return tokens
