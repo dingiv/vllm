@@ -73,8 +73,9 @@ class FsAsyncLookupManager(AsyncLookupManager):
         self,
         tier: "FileSystemTierManager",
         tier_type: str,
+        n_lookup_threads: int = 4,
     ) -> None:
-        super().__init__(tier_type=tier_type)
+        super().__init__(tier_type=tier_type, n_lookup_threads=n_lookup_threads)
         self._tier = tier
 
     def batch_lookup(
@@ -207,7 +208,9 @@ class FileSystemTierManager(SecondaryTierManager):
             thread_name_prefix="vllm_kv_py_fs",
         )
 
-        self._lookup_manager = FsAsyncLookupManager(tier=self, tier_type=self.tier_type)
+        self._lookup_manager = FsAsyncLookupManager(
+            tier=self, tier_type=self.tier_type, n_lookup_threads=4
+        )
 
         # LOCAL (qwen38 project): capacity cap with chunk-granular LRU eviction.
         # 0 = unlimited (upstream behavior). Scope is the WHOLE root_dir (all

@@ -152,7 +152,87 @@ class TestAsyncLookupManager:
         assert mgr.lookup(_key(3), ctx) is True
         mgr.shutdown()
 
-    def test_shutdown_unblocks_worker(self):
+    def test_shutdown_unblocks_workers(self):
         mgr = InMemoryLookupManager()
         mgr.shutdown()
-        assert not mgr._thread.is_alive()
+        assert all(not t.is_alive() for t in mgr._threads)
+
+    def test_cancelled_request_skips_queued_scan(self):
+        """cleanup() on a still-queued request must skip its scan entirely."""
+        import time
+
+        gate = threading.Event()
+
+        class BlockingLookupManager(AsyncLookupManager):
+            def __init__(self):
+                super().__init__(tier_type="test")
+                self.scanned_req_ids: list[str] = []
+
+            def batch_lookup(self, keys, req_context):
+                if req_context.req_id == "slow":
+                    # Hold the single batch until we flip the gate.
+                    gate.wait(timeout=5)
+                self.scanned_req_ids.append(req_context.req_id)
+                return [False] * len(keys)
+
+        mgr = BlockingLookupManager()
+        slow_ctx = _ctx("slow")
+        mgr.lookup(_key(1), slow_ctx)
+        mgr.flush()  # queued; worker now blocked inside batch_lookup
+
+        live_ctx = _ctx("live")
+        mgr.lookup(_key(2), live_ctx)
+        mgr.cleanup("slow")  # abort the slow request while queued/blocked
+        mgr.flush()
+
+        gate.set()
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline and "slow" in mgr.scanned_req_ids:
+            time.sleep(0.01)
+        assert "slow" not in mgr.scanned_req_ids  # scan skipped, not executed
+
+        mgr.lookup(_key(2), live_ctx)
+        mgr.flush()
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline and mgr.lookup(_key(2), live_ctx) is None:
+            mgr.drain_results()  # late-arriving worker results
+            time.sleep(0.01)
+        assert mgr.lookup(_key(2), live_ctx) is False  # live request resolved
+        mgr.shutdown()
+
+    def test_worker_pool_runs_batches_concurrently(self):
+        """4 workers must chew 4 held batches at once (barrier proof)."""
+        import time
+
+        barrier = threading.Barrier(4, timeout=5)
+        active_lock = threading.Lock()
+        stats = {"active": 0, "max_active": 0}
+
+        class PoolLookupManager(AsyncLookupManager):
+            def __init__(self):
+                super().__init__(tier_type="test", n_lookup_threads=4)
+
+            def batch_lookup(self, keys, req_context):
+                with active_lock:
+                    stats["active"] += 1
+                    stats["max_active"] = max(stats["max_active"], stats["active"])
+                try:
+                    barrier.wait()
+                finally:
+                    with active_lock:
+                        stats["active"] -= 1
+                return [False] * len(keys)
+
+        mgr = PoolLookupManager()
+        for i in range(4):
+            mgr.lookup(_key(100 + i), _ctx(f"r{i}"))
+            mgr.flush()
+        deadline = time.monotonic() + 6
+        while time.monotonic() < deadline:
+            mgr.drain_results()  # late-arriving worker results
+            if all(mgr.lookup(_key(100 + i), _ctx(f"r{i}")) is False
+                   for i in range(4)):
+                break
+            time.sleep(0.01)
+        assert stats["max_active"] >= 4
+        mgr.shutdown()

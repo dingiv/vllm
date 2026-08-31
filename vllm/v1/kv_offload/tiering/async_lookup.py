@@ -6,29 +6,35 @@ existence checks.
 
 Each secondary tier that wants non-blocking lookups composes its own
 AsyncLookupManager instance internally.  The manager maintains lookup
-state and uses a background thread to execute batch_lookup() calls.
+state and uses a pool of background threads to execute batch_lookup()
+calls.
 
 Locking design
 --------------
-There is no explicit lock.  Thread safety is achieved by ownership:
 
 * _lookup_state and _lookup_batch are owned exclusively by the scheduler
   thread.  lookup(), flush(), and cleanup() read and write them directly.
 
-* _lookup_queue is written by the scheduler (flush → put_nowait, one item
-  per step) and read by the background thread (get).  queue.Queue is
-  thread-safe.
+* _lookup_queue is written by the scheduler (flush → put, one item per
+  step) and read by the worker pool (get).  queue.SimpleQueue is
+  thread-safe for multi-consumer get.
 
-* _pending_results is written by the background thread (put) and read by
-  the scheduler (get_nowait inside drain_results).  queue.SimpleQueue is
-  thread-safe by design.
+* _pending_results is written by workers (put) and read by the scheduler
+  (get_nowait inside drain_results).  SimpleQueue is thread-safe for
+  multi-writer too.
+
+* _cancelled is touched by the scheduler thread (add) and by workers
+  (membership check + discard); guarded by _cancel_lock.
 
 lookup() accumulates new keys in _lookup_batch without touching the queue.
 flush() is called once per step from the tier's on_schedule_end(), posting
-the entire batch as a single queue item so the background thread sees one
-batch per step.
-drain_results() is called before any lookup() calls in the same step, so
-lookup() is a pure OrderedDict operation.
+the entire batch as a single queue item so the worker pool sees one batch
+per step.  drain_results() is called before any lookup() calls in the same
+step, so lookup() is a pure dict operation.
+
+Cancellation: when a request finishes (including aborts), cleanup() marks
+its req_id cancelled; workers skip that request's key groups still queued,
+so an aborted request's wasted scans don't delay live ones.
 """
 
 import queue
@@ -55,8 +61,8 @@ class AsyncLookupManager(ABC):
 
     Each secondary tier that wants non-blocking lookups composes its own
     AsyncLookupManager instance internally. The manager maintains lookup
-    state (cache, queue) and uses a background thread to execute the actual
-    batch_lookup() calls.
+    state (cache, queue) and uses a pool of background threads to execute
+    the actual batch_lookup() calls.
 
     Subclasses implement only batch_lookup() — all queue management,
     state tracking, and result delivery is provided by this base class.
@@ -71,6 +77,7 @@ class AsyncLookupManager(ABC):
     def __init__(
         self,
         tier_type: str,
+        n_lookup_threads: int = 4,
     ) -> None:
         self._tier_type = tier_type
 
@@ -83,26 +90,34 @@ class AsyncLookupManager(ABC):
         # Flushed as one queue item per step by flush().
         self._lookup_batch: list[tuple[OffloadKey, ReqContext]] = []
 
-        # Scheduler → worker: one full step's batch per item.
+        # Scheduler → workers: one full step's batch per item.
         # None is used as a shutdown sentinel.
         self._lookup_queue: queue.SimpleQueue[
             list[tuple[OffloadKey, ReqContext]] | None
         ] = queue.SimpleQueue()
 
-        # Worker → scheduler: completed result batches.
-        # Each item is a list of (key, found) pairs.
-        # SimpleQueue is explicitly thread-safe for one writer / one reader.
+        # Workers → scheduler: completed result batches.
         self._pending_results: queue.SimpleQueue[list[tuple[OffloadKey, bool]]] = (
             queue.SimpleQueue()
         )
         self._need_to_drain: bool = False
 
-        self._thread = threading.Thread(
-            target=self._worker,
-            name=f"vllm_offloading_lookup_{tier_type}",
-            daemon=True,
-        )
-        self._thread.start()
+        # Finished (incl. aborted) requests whose queued scans should be
+        # skipped by the workers. Guarded by _cancel_lock.
+        self._cancelled: set[str] = set()
+        self._cancel_lock = threading.Lock()
+
+        n = max(1, int(n_lookup_threads))
+        self._threads = [
+            threading.Thread(
+                target=self._worker,
+                name=f"vllm_offloading_lookup_{tier_type}_{i}",
+                daemon=True,
+            )
+            for i in range(n)
+        ]
+        for t in self._threads:
+            t.start()
 
     @abstractmethod
     def batch_lookup(
@@ -111,8 +126,8 @@ class AsyncLookupManager(ABC):
         """
         Check whether a batch of blocks exist in this tier.
 
-        Called from the worker thread — must be synchronous and must not
-        touch the primary tier or scheduler state.
+        Called from worker threads (concurrently) — must be synchronous,
+        thread-safe, and must not touch the primary tier or scheduler state.
 
         Returns a list parallel to keys: True if present, False if not.
         """
@@ -145,10 +160,10 @@ class AsyncLookupManager(ABC):
         return state.result
 
     def flush(self) -> None:
-        """Post this step's accumulated keys to the worker thread.
+        """Post this step's accumulated keys to the worker pool.
 
         Called once per step from on_schedule_end() after all lookup() calls
-        are done. The worker receives the full batch and processes it during
+        are done. The workers receive the full batch and process it during
         the model-execution window, maximising time available before the next
         step's drain_results().  Safe to call with an empty batch (no-op).
         """
@@ -175,23 +190,40 @@ class AsyncLookupManager(ABC):
     def cleanup(self, req_id: str) -> None:
         """Remove entries no longer needed by any active request.
 
-        Called from the tier's on_request_finished(). Uses the reverse
-        index to visit only keys associated with this request.
+        Called from the tier's on_request_finished() — including aborts.
+        Uses the reverse index to visit only keys associated with this
+        request, and marks the request cancelled so workers skip its still
+        queued scans.
         """
+        with self._cancel_lock:
+            self._cancelled.add(req_id)
         for key in self._req_keys.pop(req_id, ()):
-            state = self._lookup_state[key]
+            state = self._lookup_state.get(key)
+            if state is None:
+                continue
             state.request_ids.discard(req_id)
             if not state.request_ids:
                 del self._lookup_state[key]
 
     def shutdown(self) -> None:
-        """Stop the worker thread."""
-        self._lookup_queue.put(None)  # unblock _worker from _lookup_queue.get()
-        self._thread.join()
+        """Stop the worker threads."""
+        for _ in self._threads:
+            self._lookup_queue.put(None)  # unblock each _worker get()
+        for t in self._threads:
+            t.join()
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    def _cancelled_snapshot(self) -> set[str]:
+        with self._cancel_lock:
+            return set(self._cancelled)
+
+    def _discard_cancelled(self, req_ids: Iterable[str]) -> None:
+        with self._cancel_lock:
+            for req_id in req_ids:
+                self._cancelled.discard(req_id)
 
     def _worker(self) -> None:
         while True:
@@ -210,8 +242,14 @@ class AsyncLookupManager(ABC):
             if not batches:
                 continue
 
+            cancelled = self._cancelled_snapshot()
             results: list[tuple[OffloadKey, bool]] = []
-            for req_context, keys in batches.values():
+            processed_ids: list[str] = []
+            for req_id, (req_context, keys) in batches.items():
+                if req_id in cancelled:
+                    # Finished/aborted request: drop its queued scan.
+                    continue
+                processed_ids.append(req_id)
                 try:
                     hits = self.batch_lookup(keys, req_context)
                 except Exception as exc:
@@ -225,6 +263,8 @@ class AsyncLookupManager(ABC):
 
                 for key, hit in zip(keys, hits):
                     results.append((key, hit))
+
+            self._discard_cancelled(processed_ids)
 
             # Post the entire batch as one item — no lock needed.
             if results:
