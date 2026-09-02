@@ -45,6 +45,7 @@ from vllm.v1.kv_offload.base import (
     ReqContext,
     RequestOffloadingContext,
     ScheduleEndContext,
+    get_offload_block_hash,
 )
 from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
 from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
@@ -55,6 +56,10 @@ from vllm.v1.kv_offload.tiering.base import (
     ParentManager,
     SecondaryTierManager,
     TieringOffloadingMetrics,
+)
+from vllm.v1.kv_offload.tiering.chain_registry import (
+    chain_evict_enabled,
+    get_chain_registry,
 )
 
 logger = init_logger(__name__)
@@ -79,6 +84,13 @@ class RequestState:
     # time.monotonic() of this request's first deferred secondary-tier lookup;
     # None once consumed (observed) or while no secondary lookup is pending.
     secondary_lookup_start_time: float | None = None
+    # LOCAL (qwen38): chain-aware eviction bookkeeping. chain_id is the
+    # block hash of the request's first stored key; chain_depth is the
+    # running arrival-order cursor fed to the registry. Both die with this
+    # state (deleted on request finalization) -- chain METADATA outlives
+    # the request in the registry until no tier holds the blocks.
+    chain_id: bytes | None = None
+    chain_depth: int = 0
 
 
 class CPUPrimaryTierOffloadingManager(CPUOffloadingManager):
@@ -521,6 +533,11 @@ class TieringOffloadingManager(OffloadingManager):
         self.primary_tier.touch(keys, req_context)
         for tier in self.secondary_tiers:
             tier.touch(keys, req_context)
+        # LOCAL (qwen38): refresh chain recency for chain-aware eviction.
+        if chain_evict_enabled():
+            get_chain_registry().touch(
+                [get_offload_block_hash(k) for k in keys]
+            )
 
     @override
     def complete_load(self, keys: Collection[OffloadKey], req_context: ReqContext):
@@ -578,6 +595,20 @@ class TieringOffloadingManager(OffloadingManager):
 
         if primary_result is None:
             return None
+
+        # LOCAL (qwen38): register chain metadata for newly stored blocks
+        # (chain-aware eviction). Depth is the arrival-order cursor kept on
+        # the request state; store order is ascending per request (V1).
+        if chain_evict_enabled() and primary_result.keys_to_store:
+            state = self._req_state[req_context.req_id]
+            hashes = [
+                get_offload_block_hash(k) for k in primary_result.keys_to_store
+            ]
+            if state.chain_id is None:
+                state.chain_id = hashes[0]
+            state.chain_depth = get_chain_registry().register(
+                hashes, state.chain_id, state.chain_depth
+            )
 
         if primary_result.keys_to_store:
             state = self._req_state[req_context.req_id]

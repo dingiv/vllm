@@ -25,6 +25,7 @@ from vllm.v1.kv_offload.cpu.common import (
 )
 from vllm.v1.kv_offload.cpu.policies.base import BlockStatus, CachePolicy
 from vllm.v1.kv_offload.cpu.policies.factory import CachePolicyFactory
+from vllm.v1.kv_offload.tiering.chain_registry import chain_evict_enabled
 
 # LOCAL PROBE: lookup/store traces via vllm.v1.qwen_debug.
 from vllm.v1.qwen_debug import OFFLOAD_PROBE as _QWEN_OFFLOAD_PROBE
@@ -65,6 +66,11 @@ class CPUOffloadingManager(OffloadingManager):
         self._num_allocated_blocks: int = 0
         self._free_list: list[int] = []
         self.events: list[OffloadingEvent] | None = [] if enable_events else None
+        # LOCAL (qwen38): chain-aware eviction master switch. When enabled,
+        # the default LRU policy is upgraded to ChainLRUCachePolicy unless
+        # the caller pinned a specific non-default policy.
+        if cache_policy == "lru" and chain_evict_enabled():
+            cache_policy = "chain_lru"
         policy_cls = CachePolicyFactory.get_cache_policy_cls(
             cache_policy, cache_policy_module_path
         )

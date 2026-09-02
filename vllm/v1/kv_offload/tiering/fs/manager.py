@@ -40,9 +40,17 @@ from vllm.v1.kv_offload.base import (
     OffloadingEvent,
     OffloadKey,
     ReqContext,
+    get_offload_block_hash,
 )
 from vllm.v1.kv_offload.file_mapper import FileMapper
 from vllm.v1.qwen_debug import qwen_debug_log, OFFLOAD_PROBE
+
+if TYPE_CHECKING:
+    from vllm.v1.kv_offload.tiering.chain_registry import ChainRegistry
+from vllm.v1.kv_offload.tiering.chain_registry import (
+    chain_evict_enabled,
+    get_chain_registry,
+)
 
 from vllm.v1.kv_offload.tiering.async_lookup import AsyncLookupManager
 from vllm.v1.kv_offload.tiering.base import (
@@ -226,6 +234,14 @@ class FileSystemTierManager(SecondaryTierManager):
         self._evict_blocked: set[str] = set()
         self._oversize_warned = False
         self._last_evict_log = 0.0
+        # LOCAL (qwen38): chain-aware eviction scoring. When enabled,
+        # candidates that anchor the low depths of a chain still alive in
+        # this tier are skipped (deeper blocks go first), preserving the
+        # contiguous usable prefix. Deadlock fallback: if scoring skips
+        # EVERYTHING, plain mtime order wins for that pass (never refuse
+        # to evict -- the 256G quota must stay enforceable).
+        self._chain_evict = chain_evict_enabled()
+        self._chain_fallback_warn_ts = 0.0
         if self._max_kv_bytes:
             self._recount_existing_bytes()
             logger.info(
@@ -268,7 +284,16 @@ class FileSystemTierManager(SecondaryTierManager):
         """Delete oldest chunks (min mtime across the chunk's group files)
         until at least need_bytes are freed or nothing evictable remains.
         Whole-chunk eviction: all group/rank files sharing one chunk hash go
-        together (band coherence)."""
+        together (band coherence).
+
+        LOCAL (qwen38): with chain-aware eviction enabled, candidates that
+        anchor the low depths of a chain alive in this tier are skipped
+        (depth <= chain min depth + _CHAIN_ANCHOR_SPAN); the sweep stays
+        strictly tail-first so the chain's usable prefix survives. If that
+        skips every candidate, plain mtime order is used for the pass
+        (deadlock fallback -- eviction must always make progress).
+        """
+        registry = get_chain_registry() if self._chain_evict else None
         freed = 0
         while freed < need_bytes:
             candidates = [
@@ -285,8 +310,22 @@ class FileSystemTierManager(SecondaryTierManager):
                 ]
                 if not candidates:
                     break
+            pool = candidates
+            if registry is not None and not registry.is_empty():
+                pool = self._filter_chain_anchors(registry, candidates)
+                if not pool:
+                    now = time.monotonic()
+                    if now - self._chain_fallback_warn_ts >= 30.0:
+                        self._chain_fallback_warn_ts = now
+                        logger.warning(
+                            "fs tier chain-evict: all %d candidates are "
+                            "chain anchors; falling back to mtime order "
+                            "for this pass",
+                            len(candidates),
+                        )
+                    pool = candidates
             key, files = min(
-                candidates, key=lambda kv: min(t for _, _, t in kv[1])
+                pool, key=lambda kv: min(t for _, _, t in kv[1])
             )
             chunk_bytes = sum(sz for _, sz, _ in files)
             removed = True
@@ -303,7 +342,52 @@ class FileSystemTierManager(SecondaryTierManager):
             self._chunk_index.pop(key, None)
             self._used_kv_bytes -= chunk_bytes
             freed += chunk_bytes
+            if registry is not None:
+                registry.release(bytes.fromhex(key), "fs")
         return freed
+
+    # LOCAL (qwen38): anchor zone width for chain-aware scoring, in blocks
+    # beyond the chain's minimum depth present in this tier.
+    _CHAIN_ANCHOR_SPAN = 2
+
+    def _filter_chain_anchors(
+        self,
+        registry: "ChainRegistry",
+        candidates: list[tuple[str, list]],
+    ) -> list[tuple[str, list]]:
+        """Drop candidates anchoring the low depths of live chains.
+
+        A candidate is an anchor when its depth is within
+        _CHAIN_ANCHOR_SPAN of the minimum depth its chain reaches in this
+        tier's index -- evicting it would punch a hole right above the
+        chain's usable base. Chains absent from the registry (or fully
+        evicted) impose no constraint.
+        """
+        chain_min_depth: dict[bytes, int] = {}
+        metas: dict[str, tuple[bytes, int]] = {}
+        for key, _ in candidates:
+            meta = registry.meta(bytes.fromhex(key))
+            if meta is None:
+                continue
+            metas[key] = meta
+            chain_id, depth = meta
+            current = chain_min_depth.get(chain_id)
+            if current is None or depth < current:
+                chain_min_depth[chain_id] = depth
+        if not metas:
+            return candidates
+
+        def _is_anchor(key: str) -> bool:
+            meta = metas.get(key)
+            if meta is None:
+                return False
+            chain_id, depth = meta
+            return (
+                depth <= chain_min_depth[chain_id] + self._CHAIN_ANCHOR_SPAN
+                and registry.chain_alive(chain_id)
+            )
+
+        return [c for c in candidates if not _is_anchor(c[0])]
 
     def _prune_empty_dirs(self, files: list) -> None:
         """Remove now-empty hash/group dirs left behind by eviction,
@@ -378,6 +462,14 @@ class FileSystemTierManager(SecondaryTierManager):
             )
         if self.events is not None:
             self._store_job_keys[job_metadata.job_id] = list(job_metadata.keys)
+        # LOCAL (qwen38): claim chain-registry ownership for the stored
+        # hashes (released on successful eviction unlink). Refcounts held
+        # here keep chain metadata alive even before a rescan surfaces the
+        # files in _chunk_index.
+        if self._chain_evict:
+            registry = get_chain_registry()
+            for key in set(job_metadata.keys):
+                registry.acquire(get_offload_block_hash(key), "fs")
         task = functools.partial(
             batch_store_block,
             [self.file_mapper.get_file_name(key) for key in job_metadata.keys],
