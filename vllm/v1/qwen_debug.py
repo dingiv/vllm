@@ -30,13 +30,17 @@ def _areas() -> frozenset[str]:
         return frozenset()
     parts = {p.strip() for p in _MASTER.split(",") if p.strip()}
     if "all" in parts or "1" in parts:
-        return frozenset({"offload", "timing"})
+        return frozenset({"offload", "timing", "prefix"})
     return frozenset(parts)
 
 
 _AREAS = _areas()
 
 OFFLOAD_PROBE = "offload" in _AREAS or bool(os.environ.get("QWEN_OFFLOAD_PROBE"))
+
+# Eviction/prefix-cache lifecycle probes ([FREEH]/[STRIP]/[PICK] in
+# block_pool). Enabled via QWEN_DEBUG containing "prefix" (or =1/all).
+PREFIX_PROBE = "prefix" in _AREAS
 
 # 0=off, 1=every propose, 2=1-in-50 sampling. Master switch sets 1 unless the
 # legacy alias gives a finer value.

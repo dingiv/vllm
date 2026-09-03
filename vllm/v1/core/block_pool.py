@@ -30,6 +30,13 @@ import os as _os
 _SCHED_PROBE = _os.environ.get('QWEN_SCHED_PROBE', '0') == '1'
 
 logger = init_logger(__name__)
+# Prefix-cache eviction lifecycle probes ([FREEH]/[STRIP]/[PICK]), gated by
+# the unified switchboard: QWEN_DEBUG=prefix (or 1/all). Caps bound volume.
+from vllm.v1.qwen_debug import PREFIX_PROBE as _PREFIX_PROBE
+from vllm.v1.qwen_debug import qwen_debug_log as _qdbg
+_STRIP_N = 0
+_PICK_N = 0
+_FREEH_N = [0]
 
 
 class BlockHashToBlockMap:
@@ -574,6 +581,26 @@ class BlockPool:
         self,
         block: KVCacheBlock,
     ) -> list[BlockHashWithGroupId]:
+        # TEMP probe (2026-09-03): who strips registered hashes during
+        # another request's run? (QWEN_DEBUG=prefix, first 10 calls)
+        global _STRIP_N
+        if (
+            _PREFIX_PROBE
+            and block.block_hash is not None
+            and _STRIP_N < 10
+        ):
+            _STRIP_N += 1
+            import traceback as _tb
+            stack = " < ".join(f.name for f in _tb.extract_stack()[-7:-1])
+            _qdbg(
+                "prefix",
+                "[STRIP] hash=%s..grp=%s bid=%d ntok=%s by %s",
+                block.block_hash.hex()[:12],
+                block.block_hash.hex()[-8:],
+                block.block_id,
+                getattr(block, "block_hash_num_tokens", "?"),
+                stack,
+            )
         block_hashes: list[BlockHashWithGroupId] = []
         if block.block_hash is not None:
             block_hashes.append(block.block_hash)
@@ -657,10 +684,51 @@ class BlockPool:
         Returns:
             A list of new block.
         """
+        global _PICK_N
         if num_blocks > self.get_num_free_blocks():
             raise ValueError(f"Cannot get {num_blocks} free blocks from the pool")
 
-        ret: list[KVCacheBlock] = self.free_block_queue.popleft_n(num_blocks)
+        # Two-pass selection (2026-09-03, qwen38): consume true garbage
+        # blocks (never cached / hash already stripped) before touching
+        # hash-carrying cached blocks. This is what makes partial eviction
+        # possible — cached prefixes are only given up when capacity truly
+        # demands it, and then in the queue's free order (tail-first).
+        ret: list[KVCacheBlock] = []
+        if self.enable_caching:
+            garbage: list[KVCacheBlock] = []
+            cached: list[KVCacheBlock] = []
+            node = self.free_block_queue.fake_free_list_head.next_free_block
+            _tail = self.free_block_queue.fake_free_list_tail
+            while node is not None and node is not _tail:
+                nxt = node.next_free_block
+                (garbage if node.block_hash is None else cached).append(node)
+                node = nxt
+            ret = garbage[:num_blocks]
+            if len(ret) < num_blocks:
+                # Global depth order across ALL free batches (mid-run
+                # remove_skipped_blocks releases shallow checkpoints before
+                # the finish batch lands; batch-local sorting alone leaves
+                # them ahead of deeper, less valuable blocks).
+                cached.sort(
+                    key=lambda b: -(getattr(b, "block_hash_num_tokens", 0) or 0)
+                )
+                ret += cached[: num_blocks - len(ret)]
+            if _PREFIX_PROBE and len(ret) > len(garbage[:num_blocks]) and _PICK_N < 12:
+                _PICK_N += 1
+                _snap = garbage + cached
+                _qdbg(
+                    "prefix",
+                    "[PICK] garbage=%d qhead(bid,ntok)=%s",
+                    len(garbage[:num_blocks]),
+                    ",".join(
+                        f"{b.block_id}/{getattr(b, 'block_hash_num_tokens', -1)}"
+                        for b in _snap[:8]
+                    ),
+                )
+            for block in ret:
+                self.free_block_queue.remove(block)
+        if len(ret) < num_blocks:
+            ret += self.free_block_queue.popleft_n(num_blocks - len(ret))
 
         # In order to only iterate the list once, we duplicated code a bit
         if self.enable_caching:
@@ -753,6 +821,26 @@ class BlockPool:
                     blocks_with_hash.append(block)
 
         # Blocks without hash get evicted first - prepend them last to the tail
+        # Within the hash-carrying subset, order by covered depth (deep
+        # first): the caller's tail-first intent is expressed over the FULL
+        # list, and null interleaving (mamba align) otherwise inverts the
+        # relative order of the sparse real blocks — shallow grid
+        # checkpoints would be evicted before deep ones.
+        blocks_with_hash.sort(
+            key=lambda b: -(getattr(b, "block_hash_num_tokens", 0) or 0)
+        )
+        if _PREFIX_PROBE and blocks_with_hash and _FREEH_N[0] < 25:
+            import traceback as _tb
+            _caller = " < ".join(f.name for f in _tb.extract_stack()[-6:-1])
+            for _b in blocks_with_hash[:4]:
+                _FREEH_N[0] += 1
+                _qdbg(
+                    "prefix",
+                    "[FREEH] bid=%d ntok=%s by %s",
+                    _b.block_id,
+                    getattr(_b, "block_hash_num_tokens", -1),
+                    _caller,
+                )
         self.free_block_queue.prepend_n(blocks_without_hash)
         self.free_block_queue.append_n(blocks_with_hash)
 
