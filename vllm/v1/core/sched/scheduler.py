@@ -245,6 +245,7 @@ class Scheduler(SchedulerInterface):
             )
         speculative_config = vllm_config.speculative_config
         self.use_eagle = False
+        self.use_eagle_cache_drop = False
         self.num_spec_tokens = vllm_config.num_speculative_tokens
         self.num_lookahead_tokens = 0
         self.dynamic_sd_lookup: list[int] | None = None
@@ -258,6 +259,8 @@ class Scheduler(SchedulerInterface):
             if speculative_config.use_eagle():
                 self.use_eagle = True
                 self.num_lookahead_tokens = self.num_spec_tokens
+            if speculative_config.use_eagle_preserves_target_kv_cache():
+                self.use_eagle_cache_drop = True
             if speculative_config.uses_draft_model():
                 self.num_lookahead_tokens = self.num_spec_tokens
             if speculative_config.use_dflash():
@@ -280,7 +283,10 @@ class Scheduler(SchedulerInterface):
             max_model_len=self.max_model_len,
             max_in_flight_tokens=vllm_config.max_in_flight_tokens,
             enable_caching=self.cache_config.enable_prefix_caching,
-            use_eagle=self.use_eagle,
+            # Precise capability bit (upstream PR #54163): only eagle-family
+            # drafters pollute target KV groups, so only they take the
+            # prefix-cache last-block drop. DFlash/DSpark are excluded.
+            use_eagle=self.use_eagle_cache_drop,
             log_stats=self.log_stats,
             enable_kv_cache_events=self.enable_kv_cache_events,
             dcp_world_size=self.dcp_world_size,
