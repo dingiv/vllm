@@ -250,7 +250,12 @@ class SchedulerOffloadConfig(NamedTuple):
 
         use_eagle = (
             vllm_config.speculative_config is not None
-            and vllm_config.speculative_config.use_eagle()
+            # Precise capability bit (backport of upstream PR #54165): only
+            # eagle-family drafters pollute target KV groups. DFlash/DSpark
+            # must not trigger the all-groups eagle fallback, or every group's
+            # trailing chunk is excluded from offloading and store/lookup
+            # windows drift.
+            and vllm_config.speculative_config.use_eagle_preserves_target_kv_cache()
         )
         if use_eagle and not eagle_groups:
             eagle_groups = set(range(len(kv_cache_config.kv_cache_groups)))

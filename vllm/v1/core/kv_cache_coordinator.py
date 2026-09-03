@@ -854,6 +854,29 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         hit_blocks: list[list[KVCacheBlock]] = [[] for _ in range(num_groups)]
         hit_lengths: list[int] = [0] * num_groups
 
+        # LOCAL (qwen38, TEMP probe): why do re-visits of an identical
+        # session miss while the hash table still holds its entries?
+        if _SCHED_PROBE and len(block_hashes) > 50:
+            _hb_hit: list[int] = []
+            for _hb_spec, _hb_gids, _hb_cls, _hb_eagle in self.attention_groups:
+                _hb_blocks, _hb_len = _hb_cls.find_longest_cache_hit(
+                    block_hashes=block_hashes,
+                    max_length=max_cache_hit_length,
+                    kv_cache_group_ids=_hb_gids,
+                    block_pool=self.block_pool,
+                    kv_cache_spec=_hb_spec,
+                    drop_eagle_block=_hb_eagle,
+                    alignment_tokens=self._cache_hit_alignment_tokens,
+                )
+                _hb_hit.append((_hb_gids[0], _hb_len))
+            print(
+                f"[HITPROBE] n_hashes={len(block_hashes)} "
+                f"max_len={max_cache_hit_length} "
+                f"per_group={_hb_hit[:6]} "
+                f"table={len(self.block_pool.cached_block_hash_to_block)}",
+                flush=True,
+            )
+
         for spec, group_ids, manager_cls, use_eagle in self.attention_groups:
             blocks, group_hit = manager_cls.find_longest_cache_hit(
                 block_hashes=block_hashes,

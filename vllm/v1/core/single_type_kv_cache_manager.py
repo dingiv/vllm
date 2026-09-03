@@ -13,6 +13,7 @@ from vllm.v1.core.kv_cache_utils import (
     BlockHashListWithBlockSize,
     BlockHashWithGroupId,
     KVCacheBlock,
+    get_block_hash,
     resolve_block_hashes,
 )
 from vllm.v1.kv_cache_interface import (
@@ -1377,6 +1378,23 @@ class MambaManager(SingleTypeKVCacheManager):
             max_num_blocks -= 1
         # Search from right to left and early stop when a match is found.
         _cm_misses: list[int] = []  # TEMP 探针(波峰排查)
+        if _SCHED_PROBE and max_num_blocks > 8:
+            # LOCAL (qwen38, TEMP): revisit-miss diagnosis — compare the
+            # request's probed keys against the table's stored keys.
+            _tbl = block_pool.cached_block_hash_to_block
+            _tbl_keys = list(_tbl._cache.keys())[:2]
+            _tbl_pfx = [get_block_hash(k).hex()[:12] for k in _tbl_keys]
+            print(
+                "[KEYCMP] n_req_hashes=%d probe[0]=%s probe[1]=%s "
+                "table_n=%d table_keys[:2]=%s" % (
+                    len(block_hashes),
+                    block_hashes[0].hex()[:12],
+                    block_hashes[1].hex()[:12] if len(block_hashes) > 1 else "?",
+                    len(_tbl._cache),
+                    _tbl_pfx,
+                ),
+                flush=True,
+            )
         for i in range(max_num_blocks - 1, -1, -1):
             if cached_block := block_pool.get_cached_block(
                 block_hashes[i], kv_cache_group_ids
