@@ -109,6 +109,7 @@ def test_allocator_and_mask_agree_on_the_grid() -> None:
     assert mask == grid
 
 
+@pytest.mark.skip(reason="part-2 only: requires upstream relocation architecture absent from the 0.27.2 base (see commit aa774d883)")
 def test_admission_accounts_for_grid_crossings() -> None:
     """A step whose token span crosses a grid boundary needs one extra block
     (the spared one is not recycled); the estimate must include it or pool
@@ -175,6 +176,7 @@ def _prefill_with_caching(manager: MambaManager, request, num_blocks: int) -> No
         manager.remove_skipped_blocks(req_id, num_tokens)
 
 
+@pytest.mark.skip(reason="part-2 only: requires upstream relocation architecture absent from the 0.27.2 base (see commit aa774d883)")
 def test_rolling_checkpoint_registers_newest_boundary() -> None:
     """The newest frozen non-grid boundary must become a prefix-cache resume
     point (the decode-end checkpoint): an append-style resubmit then
@@ -195,6 +197,7 @@ def test_rolling_checkpoint_registers_newest_boundary() -> None:
     assert cached is not None, "rolling checkpoint hash not registered"
 
 
+@pytest.mark.skip(reason="part-2 only: requires upstream relocation architecture absent from the 0.27.2 base (see commit aa774d883)")
 def test_rolling_checkpoint_survives_relocation_with_spec_window() -> None:
     """With a speculative window, the relocation loop must spare (not
     relocate) a hash-carrying block: relocation reuses the block object and
