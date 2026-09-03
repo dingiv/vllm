@@ -3,7 +3,7 @@
 import itertools
 from abc import ABC, abstractmethod
 from collections import defaultdict
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import ClassVar
 
 from vllm.utils.math_utils import cdiv
@@ -36,6 +36,22 @@ import os as _os
 _SCHED_PROBE = _os.environ.get('QWEN_SCHED_PROBE', '0') == '1'
 
 
+def retention_grid_block(
+    block_idx: int, retention_interval: int | None, block_size: int
+) -> bool:
+    """Single source of truth for the sparse-retention checkpoint grid:
+    block ``block_idx`` (holding state for tokens up to
+    ``(block_idx + 1) * block_size``) is a grid checkpoint iff its end lands
+    on a positive ``retention_interval`` boundary wider than one block. Used
+    by ``MambaManager.reachable_block_mask`` (what to REGISTER) and by the
+    align allocator (what to SPARE from recycling) — the two must never
+    drift. (Backport of upstream PR #53803.)"""
+    if not retention_interval:
+        return False
+    per_segment = retention_interval // block_size
+    return per_segment > 1 and (block_idx + 1) % per_segment == 0
+
+
 class SingleTypeKVCacheManager(ABC):
     """
     An abstract base class for a manager that handle the kv cache management
@@ -55,6 +71,7 @@ class SingleTypeKVCacheManager(ABC):
         pcp_world_size: int = 1,
         needs_kv_cache_zeroing: bool = False,
         max_admission_blocks_per_request: int | None = None,
+        retention_interval: int | None = None,
     ) -> None:
         """
         Initializes the SingleTypeKVCacheManager.
@@ -74,6 +91,9 @@ class SingleTypeKVCacheManager(ABC):
                 block until the request finishes.
         """
         self.scheduler_block_size = scheduler_block_size
+        # None = dense, 0 = replay boundary only, > 0 = one checkpoint per
+        # interval. (Backport of upstream PR #53803.)
+        self.retention_interval = retention_interval
         # The block size for this manager; used for actual block allocation.
         self.block_size = kv_cache_spec.block_size
         self.dcp_world_size = dcp_world_size
@@ -600,11 +620,15 @@ class SingleTypeKVCacheManager(ABC):
         request_id: str,
         first_block: int,
         last_block: int,
+        keep_block: "Callable[[int], bool] | None" = None,
     ) -> None:
         """Free blocks in ``[first_block, last_block)`` and replace with null_block.
 
         Iterates backward so newly-evictable tail blocks are reached even after
-        earlier blocks in the range were nulled in a prior call.
+        earlier blocks in the range were nulled in a prior call. Blocks for
+        which ``keep_block(idx)`` is true are skipped (not freed, and the sweep
+        continues past them) — used by align-mode Mamba to spare
+        retention-grid checkpoint blocks. (Backport of upstream PR #53803.)
         """
         if request_id not in self.req_to_blocks:
             return
@@ -617,6 +641,8 @@ class SingleTypeKVCacheManager(ABC):
         for i in range(last_block - 1, first_block - 1, -1):
             if blocks[i] == self._null_block:
                 break
+            if keep_block is not None and keep_block(i):
+                continue
             freed.append(blocks[i])
             blocks[i] = self._null_block
         if freed:
@@ -627,6 +653,7 @@ class SingleTypeKVCacheManager(ABC):
         request_id: str,
         processed_computed_tokens: int,
         num_prompt_tokens: int | None = None,
+        keep_block: "Callable[[int], bool] | None" = None,
     ) -> None:
         """
         Remove and free the blocks that are no longer needed for attention computation.
@@ -659,7 +686,9 @@ class SingleTypeKVCacheManager(ABC):
         # range), so we must cap to the number of blocks that currently exist for
         # this request.
         num_skipped_blocks = min(num_skipped_blocks, len(blocks))
-        self._remove_blocks_in_range(request_id, 0, num_skipped_blocks)
+        self._remove_blocks_in_range(
+            request_id, 0, num_skipped_blocks, keep_block=keep_block
+        )
 
     def get_num_skipped_tokens(self, num_computed_tokens: int) -> int:
         """
@@ -1304,6 +1333,20 @@ class MambaManager(SingleTypeKVCacheManager):
             # into a private cow_block; we record that block for connector
             # offload (see _pending_partial_tail_offloads).
             self._producer_partial_tail_reqs: dict[str, int] = {}
+            # Newest registered rolling decode-end checkpoint per request.
+            # (Backport of upstream PR #53803.)
+            self._rolling_registered: dict[str, int] = {}
+
+    def _retention_on_grid(self, block_idx: int) -> bool:
+        """True when ``block_idx`` holds the state a retention-grid checkpoint
+        needs — the same predicate ``reachable_block_mask`` retains under
+        ``--prefix-cache-retention-interval`` (see ``retention_grid_block``).
+        Interior state blocks are recycled (relocated) by the align allocator,
+        so grid blocks must be spared there, or they are nulled before
+        ``cache_blocks`` can register them."""
+        return retention_grid_block(
+            block_idx, self.retention_interval, self.block_size
+        )
 
     @classmethod
     def find_longest_cache_hit(
@@ -1467,11 +1510,12 @@ class MambaManager(SingleTypeKVCacheManager):
             if per_segment <= 1:
                 # Interval at/below the block size: every block is a boundary.
                 return None
-            first_boundary = (
-                start_block + per_segment
-            ) // per_segment * per_segment - 1
-            for i in range(first_boundary - start_block, len(mask), per_segment):
-                mask[i] = True
+            # Grid predicate shared with the align allocator's relocation
+            # spare — the mask and the allocator must agree exactly.
+            # (Backport of upstream PR #53803.)
+            for i in range(start_block, end_block):
+                if retention_grid_block(i, segment_tokens, block_size):
+                    mask[i - start_block] = True
 
         # (2) Reachable-boundary states: the replay boundary (``num_prompt - 1``,
         # capped by ``get_computed_blocks``) and any shared-prefix junction, both
@@ -1490,11 +1534,19 @@ class MambaManager(SingleTypeKVCacheManager):
         request_id: str,
         processed_computed_tokens: int,
         num_prompt_tokens: int | None = None,
+        keep_block: "Callable[[int], bool] | None" = None,
     ) -> None:
         assert isinstance(self.kv_cache_spec, MambaSpec)
 
         super().remove_skipped_blocks(
-            request_id, processed_computed_tokens, num_prompt_tokens
+            request_id,
+            processed_computed_tokens,
+            num_prompt_tokens,
+            keep_block=(
+                keep_block
+                if keep_block is not None
+                else (self._retention_on_grid if self.retention_interval else None)
+            ),
         )
         if self.mamba_cache_mode == "align":
             # `last_state_block_idx` refers to the block index allocated two steps ago.
@@ -1509,6 +1561,9 @@ class MambaManager(SingleTypeKVCacheManager):
                 last_state_block_idx is not None
                 and last_state_block_idx
                 < cdiv(processed_computed_tokens, self.block_size) - 1
+                # Grid checkpoints must survive in place; freeing them here
+                # would defeat the relocation spare. (PR #53803)
+                and not self._retention_on_grid(last_state_block_idx)
             ):
                 blocks = self.req_to_blocks[request_id]
                 if blocks[last_state_block_idx] != self._null_block:
