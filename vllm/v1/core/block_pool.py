@@ -12,6 +12,7 @@ from vllm.distributed.kv_events import (
 )
 from vllm.logger import init_logger
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
+from vllm.v1.qwen_debug import qwen_debug_log as _qdbg
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     BlockHashWithGroupId,
@@ -35,8 +36,11 @@ logger = init_logger(__name__)
 from vllm.v1.qwen_debug import PREFIX_PROBE as _PREFIX_PROBE
 from vllm.v1.qwen_debug import qwen_debug_log as _qdbg
 _STRIP_N = 0
+_PROBE_CAP = int(_os.environ.get("QWEN_PROBE_CAP", "12"))
 _PICK_N = 0
 _FREEH_N = [0]
+_REG_N = 0
+_REG_TOT = {}
 
 
 class BlockHashToBlockMap:
@@ -239,8 +243,15 @@ class BlockPool:
         num_full_blocks: int,
         block_size: int,
         kv_cache_group_id: int,
-        block_mask: list[bool] | None = None,
+            block_mask: list[bool] | None = None,
     ) -> None:
+        global _REG_N
+        if _PREFIX_PROBE:
+            _key = request.request_id[-8:]
+            _REG_TOT[_key] = _REG_TOT.get(_key, 0) + num_full_blocks
+            _REG_N += 1
+            if _REG_N % 150 == 0:
+                _qdbg("prefix", "[REGTOT] %s", sorted(_REG_TOT.items()))
         """Cache a list of full blocks for prefix caching.
         This function takes a list of blocks that will have their block hash
         metadata to be updated and cached. Given a request, it updates the
@@ -587,7 +598,7 @@ class BlockPool:
         if (
             _PREFIX_PROBE
             and block.block_hash is not None
-            and _STRIP_N < 10
+            and _STRIP_N < _PROBE_CAP
         ):
             _STRIP_N += 1
             import traceback as _tb
@@ -616,6 +627,9 @@ class BlockPool:
             ):
                 removed_hashes.append(block_hash)
         block.reset_hash()
+        _qdbg("prefix", "[RM] blk=%d n=%d k0=%s", block.block_id,
+              len(removed_hashes),
+              removed_hashes[0].hex()[-8:] if removed_hashes else "-")
         return removed_hashes
 
     def _emit_block_removed_events(
@@ -640,11 +654,15 @@ class BlockPool:
         num_tokens: int | None,
     ) -> None:
         if block.block_hash == block_hash_with_group_id:
+            _qdbg("prefix", "[I-EQRET] blk=%d key=%s", block.block_id,
+                  block_hash_with_group_id.hex()[-8:])
             return
 
         if self.cached_block_hash_to_block.contain(
             block_hash_with_group_id, block.block_id
         ):
+            _qdbg("prefix", "[I-CONTRET] blk=%d key=%s", block.block_id,
+                  block_hash_with_group_id.hex()[-8:])
             return
 
         if block.block_hash is None:
@@ -654,6 +672,8 @@ class BlockPool:
                 block_hash_with_group_id
             )
         self.cached_block_hash_to_block.insert(block_hash_with_group_id, block)
+        _qdbg("prefix", "[I] blk=%d key=%s ntok=%s", block.block_id,
+              block_hash_with_group_id.hex()[-8:], num_tokens)
 
     def move_block_hashes(
         self,
@@ -666,6 +686,8 @@ class BlockPool:
         : the prefix cache holds a private copy (``dst_block``)
         under the same hashes instead. Entries stay live; no events emitted.
         """
+        _qdbg("prefix", "[MV] src=%d dst=%d", src_block.block_id,
+              dst_block.block_id)
         assert dst_block.block_hash is None
         assert dst_block.block_id not in self.cached_block_hashes_by_block
         num_tokens = src_block.block_hash_num_tokens
@@ -713,7 +735,7 @@ class BlockPool:
                     key=lambda b: -(getattr(b, "block_hash_num_tokens", 0) or 0)
                 )
                 ret += cached[: num_blocks - len(ret)]
-            if _PREFIX_PROBE and len(ret) > len(garbage[:num_blocks]) and _PICK_N < 12:
+            if _PREFIX_PROBE and len(ret) > len(garbage[:num_blocks]) and _PICK_N < _PROBE_CAP:
                 _PICK_N += 1
                 _snap = garbage + cached
                 _qdbg(
@@ -761,6 +783,8 @@ class BlockPool:
         if self.metrics_collector:
             self.metrics_collector.on_block_evicted(block)
 
+        _qdbg("prefix", "[EVICT-GPU] blk=%d key=%s", block.block_id,
+              block.block_hash.hex()[-8:] if block.block_hash else "-")
         evicted_hashes = self._remove_cached_block_hashes(block)
         if not evicted_hashes:
             # The block doesn't have hash, eviction is not needed
@@ -829,7 +853,7 @@ class BlockPool:
         blocks_with_hash.sort(
             key=lambda b: -(getattr(b, "block_hash_num_tokens", 0) or 0)
         )
-        if _PREFIX_PROBE and blocks_with_hash and _FREEH_N[0] < 25:
+        if _PREFIX_PROBE and blocks_with_hash and _FREEH_N[0] < _PROBE_CAP:
             import traceback as _tb
             _caller = " < ".join(f.name for f in _tb.extract_stack()[-6:-1])
             for _b in blocks_with_hash[:4]:
@@ -893,6 +917,7 @@ class BlockPool:
             self.metrics_collector.reset()
 
         logger.info("Successfully reset prefix cache")
+        _qdbg("prefix", "[RST] prefix cache RESET")
 
         if self.enable_kv_cache_events:
             self.kv_event_queue.append(AllBlocksCleared())

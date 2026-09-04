@@ -209,6 +209,11 @@ class CPUOffloadingManager(OffloadingManager):
                 return None
             if num_blocks_to_evict > self._num_evictable_cache_blocks:
                 # Eviction will fail.
+                from vllm.v1.qwen_debug import qwen_debug_log as _q
+                _q("offload",
+                   "[CPU-EVFULL] need=%d evictable=%d — store REJECT, "
+                   "caller will retry/fail",
+                   num_blocks_to_evict, self._num_evictable_cache_blocks)
                 return None
             # There is a still a chance for eviction failure as some of the
             # idle blocks might be in the protected list.
@@ -218,7 +223,12 @@ class CPUOffloadingManager(OffloadingManager):
             protected = set(keys)
             evicted = self._policy.evict(num_blocks_to_evict, protected)
             if evicted is None:
+                from vllm.v1.qwen_debug import qwen_debug_log as _q
+                _q("offload", "[CPU-EVFULL-PROT] need=%d — policy evict failed",
+                   num_blocks_to_evict)
                 return None
+            from vllm.v1.qwen_debug import qwen_debug_log as _q
+            _q("offload", "[CPU-EVICT] n=%d", len(evicted))
 
             # cache-policy removes only idle blocks.
             self._num_evictable_cache_blocks -= len(evicted)
