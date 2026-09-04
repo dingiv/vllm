@@ -124,6 +124,11 @@ class SingleTypeKVCacheManager(ABC):
         # This is only used to track the RUNNING requests, we do not track the
         # data for preempted ones.
         self.num_cached_block: dict[str, int] = {}
+        # Self-heal bookkeeping (2026-09-04): request ids whose
+        # num_cached_block >= num_full early-return was already verified
+        # against the hash table once (async spec-order can starve a
+        # concurrent prefill's cache commits; see docs TODO §10).
+        self._healed_reqs: set[str] = set()
 
         self.kv_cache_group_id = kv_cache_group_id
         self._null_block = block_pool.null_block
@@ -468,8 +473,40 @@ class SingleTypeKVCacheManager(ABC):
         num_cached_blocks = self.num_cached_block.get(request.request_id, 0)
         num_full_blocks = num_tokens // self.block_size
 
+        from vllm.v1.qwen_debug import PREFIX_PROBE as _PP, qwen_debug_log as _qdbg
+        if _PP:
+            import itertools as _it
+            _n = getattr(self, "_cb_n", 0) + 1
+            self._cb_n = _n
+            if _n <= 6 or _n % 50 == 0:
+                _qdbg(
+                    "prefix",
+                    "[CB] req=%s nct=%s ntok=%s cached=%d full=%d",
+                    request.request_id[-8:],
+                    getattr(request, "num_computed_tokens", "?"),
+                    num_tokens,
+                    num_cached_blocks,
+                    num_full_blocks,
+                )
+
         if num_cached_blocks >= num_full_blocks:
-            return
+            # Self-heal (2026-09-04): bookkeeping can claim blocks are cached
+            # while the hash table holds none of them (async output
+            # serialization starves a concurrent prefill's cache commits to a
+            # single end-of-prefill call that then early-returns). Verify
+            # against reality once per request; re-run the masked full range
+            # — the mask keeps null/non-checkpoint slots out and re-inserting
+            # existing keys is a no-op.
+            if request.request_id in self._healed_reqs:
+                return
+            self._healed_reqs.add(request.request_id)
+            _blocks = self.req_to_blocks.get(request.request_id, [])
+            if not any(
+                i < len(_blocks) and _blocks[i].block_hash is None
+                for i in range(num_full_blocks)
+            ):
+                return
+            num_cached_blocks = 0
 
         # Token boundaries whose reachable tail must be retained under sparse
         # retention: the replay boundary (``num_prompt - 1``, capped by
@@ -536,6 +573,7 @@ class SingleTypeKVCacheManager(ABC):
         # Default to [] in case a request is freed (aborted) before alloc.
         req_blocks = self.req_to_blocks.pop(request_id, [])
         self.num_cached_block.pop(request_id, None)
+        self._healed_reqs.discard(request_id)
         self._partial_hit_reqs.pop(request_id, None)
         return req_blocks
 
