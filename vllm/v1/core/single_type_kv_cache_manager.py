@@ -500,13 +500,11 @@ class SingleTypeKVCacheManager(ABC):
             if request.request_id in self._healed_reqs:
                 return
             self._healed_reqs.add(request.request_id)
-            _blocks = self.req_to_blocks.get(request.request_id, [])
-            if not any(
-                i < len(_blocks) and _blocks[i].block_hash is None
-                for i in range(num_full_blocks)
-            ):
-                return
-            num_cached_blocks = 0
+            self._heal_missing_registrations(
+                request, num_full_blocks, retention_interval
+            )
+            return
+
 
         # Token boundaries whose reachable tail must be retained under sparse
         # retention: the replay boundary (``num_prompt - 1``, capped by
@@ -535,6 +533,49 @@ class SingleTypeKVCacheManager(ABC):
         )
 
         self.num_cached_block[request.request_id] = num_full_blocks
+
+    def _heal_missing_registrations(
+        self,
+        request: Request,
+        num_full_blocks: int,
+        retention_interval: int | None,
+    ) -> None:
+        """Re-register hash-less positions the bookkeeping claimed cached.
+
+        Direct per-position insert: skips blocks that already carry a hash
+        (cache_full_blocks would assert on same-depth re-registration) and
+        honours the retention mask so mamba non-checkpoint slots stay out.
+        """
+        from vllm.v1.core.kv_cache_utils import make_block_hash_with_group_id
+        _blocks = self.req_to_blocks.get(request.request_id, [])
+        _hashes = getattr(request, "block_hashes", None) or []
+        _limit = min(num_full_blocks, len(_blocks), len(_hashes))
+        if _limit <= 0:
+            return
+        _mask = self.reachable_block_mask(
+            start_block=0,
+            end_block=_limit,
+            alignment_tokens=self.scheduler_block_size,
+            kv_cache_spec=self.kv_cache_spec,
+            use_eagle=self.use_eagle,
+            retention_interval=retention_interval,
+            reachable_boundaries=[request.num_prompt_tokens - 1]
+            + (
+                [request.shared_prefix_boundary]
+                if request.shared_prefix_boundary
+                else []
+            ),
+        )
+        for _i in range(_limit):
+            _blk = _blocks[_i]
+            if not _mask[_i] or _blk.block_hash is not None:
+                continue
+            self.block_pool._insert_block_hash(
+                make_block_hash_with_group_id(_hashes[_i], self.kv_cache_group_id),
+                _blk,
+                num_tokens=(_i + 1) * self.block_size,
+            )
+
 
     @classmethod
     def reachable_block_mask(
