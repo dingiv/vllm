@@ -242,12 +242,24 @@ class FileSystemTierManager(SecondaryTierManager):
         # to evict -- the 256G quota must stay enforceable).
         self._chain_evict = chain_evict_enabled()
         self._chain_fallback_warn_ts = 0.0
+        # Restart recovery runs regardless of quota (LOCAL 2026-09-05):
+        # keys are content hashes, so files left by a previous engine
+        # instance stay valid and lookup must find them even when this
+        # run sets no cap (bare --offload-disk). Skipping the scan used
+        # to orphan the whole tree: unindexed files are neither served
+        # nor evicted.
+        self._recount_existing_bytes()
         if self._max_kv_bytes:
-            self._recount_existing_bytes()
             logger.info(
                 "fs tier quota: max=%d bytes, existing usage=%d bytes "
                 "(scope=%s)",
                 self._max_kv_bytes, self._used_kv_bytes, self._root,
+            )
+        else:
+            logger.info(
+                "fs tier: no quota, existing usage=%d bytes "
+                "(recovery scan, scope=%s)",
+                self._used_kv_bytes, self._root,
             )
 
     def _iter_block_files(self) -> Iterable[str]:
