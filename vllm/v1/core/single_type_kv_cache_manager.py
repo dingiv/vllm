@@ -60,6 +60,10 @@ class SingleTypeKVCacheManager(ABC):
 
     supports_fine_grained_hash_lookup: ClassVar[bool] = False
 
+    # Cross-instance probe budget: the 15 group managers observe the same
+    # request, so request-keyed sampling must share one state map.
+    _SHARED_PROBE: ClassVar[object] = None
+
     def __init__(
         self,
         kv_cache_spec: KVCacheSpec,
@@ -129,6 +133,13 @@ class SingleTypeKVCacheManager(ABC):
         # against the hash table once (async spec-order can starve a
         # concurrent prefill's cache commits; see docs TODO §10).
         self._healed_reqs: set[str] = set()
+        self._seen_cache_blocks_reqs: set[str] = set()
+
+        from vllm.v1.qwen_debug import ProbeLogger
+
+        if SingleTypeKVCacheManager._SHARED_PROBE is None:
+            SingleTypeKVCacheManager._SHARED_PROBE = ProbeLogger("prefix")
+        self._probe = ProbeLogger("prefix")
 
         self.kv_cache_group_id = kv_cache_group_id
         self._null_block = block_pool.null_block
@@ -308,6 +319,8 @@ class SingleTypeKVCacheManager(ABC):
         # them so cache_blocks() will not try to re-cache blocks that already
         # have a block_hash set.
         self.num_cached_block[request_id] = len(req_blocks)
+        from vllm.v1.qwen_debug import qwen_debug_log as _q
+        _q("prefix", "[NCB-ADM] req=%s n=%d", request_id[-8:], len(req_blocks))
         if self._has_partial_local_hit(new_computed_blocks, num_local_computed_tokens):
             # Record the partial tail for the CoW redirect in
             # allocate_new_blocks; cap the cached count at the full blocks so
@@ -315,6 +328,8 @@ class SingleTypeKVCacheManager(ABC):
             block_idx = num_local_computed_tokens // self.block_size
             self._partial_hit_reqs[request_id] = (block_idx, new_computed_blocks[-1])
             self.num_cached_block[request_id] = block_idx
+            from vllm.v1.qwen_debug import qwen_debug_log as _q
+            _q("prefix", "[NCB-PH] req=%s idx=%d", request_id[-8:], block_idx)
 
     def allocate_external_computed_blocks(
         self,
@@ -473,33 +488,57 @@ class SingleTypeKVCacheManager(ABC):
         num_cached_blocks = self.num_cached_block.get(request.request_id, 0)
         num_full_blocks = num_tokens // self.block_size
 
-        from vllm.v1.qwen_debug import PREFIX_PROBE as _PP, qwen_debug_log as _qdbg
+        from vllm.v1.qwen_debug import PREFIX_PROBE as _PP
         if _PP:
-            import itertools as _it
-            _n = getattr(self, "_cb_n", 0) + 1
-            self._cb_n = _n
-            if _n <= 6 or _n % 50 == 0:
-                _qdbg(
-                    "prefix",
-                    "[CB] req=%s nct=%s ntok=%s cached=%d full=%d",
-                    request.request_id[-8:],
-                    getattr(request, "num_computed_tokens", "?"),
-                    num_tokens,
-                    num_cached_blocks,
-                    num_full_blocks,
-                )
+            # Shared across the 15 group managers: one budget per request.
+            self._SHARED_PROBE.sample(
+                request.request_id[-8:],
+                6,
+                50,
+                "[CB] req=%s nct=%s ntok=%s cached=%d full=%d",
+                request.request_id[-8:],
+                getattr(request, "num_computed_tokens", "?"),
+                num_tokens,
+                num_cached_blocks,
+                num_full_blocks,
+            )
 
         if num_cached_blocks >= num_full_blocks:
-            # Self-heal (2026-09-04): bookkeeping can claim blocks are cached
-            # while the hash table holds none of them (async output
-            # serialization starves a concurrent prefill's cache commits to a
-            # single end-of-prefill call that then early-returns). Verify
-            # against reality once per request; re-run the masked full range
-            # — the mask keeps null/non-checkpoint slots out and re-inserting
-            # existing keys is a no-op.
-            if request.request_id in self._healed_reqs:
+            # Poisoned-bookkeeping guard (2026-09-04): trust the blocks, not
+            # the counter. Two sources inflate num_cached_block past real
+            # registrations: (a) mamba-align admission counts NULL placeholder
+            # blocks into len(req_blocks); (b) async output serialization
+            # starves a concurrent prefill's commits into one end call that
+            # then early-returns. Either way the request's checkpoints never
+            # land in the table and its follow-ups miss 100% (all-groups
+            # veto). If ANY position in the claimed range lacks a hash,
+            # re-register exactly those (mask-honouring, idempotent).
+            _blks = self.req_to_blocks.get(request.request_id, [])
+            from vllm.v1.core.kv_cache_utils import (
+                make_block_hash_with_group_id as _mk,
+            )
+            _n = min(num_full_blocks, len(_blks), len(request.block_hashes))
+            # NULL spacer positions (mamba align, shared block 0) never carry
+            # a hash by design — demanding one there reports poison on every
+            # exact-replay request. Skip them; only real blocks must match.
+            _poisoned = any(
+                _blks[i].block_hash
+                != _mk(request.block_hashes[i], self.kv_cache_group_id)
+                for i in range(_n)
+                if _blks[i].block_id != 0
+            )
+            if request.request_id in self._healed_reqs or not _poisoned:
                 return
             self._healed_reqs.add(request.request_id)
+            self._probe.sample(
+                request.request_id[-8:],
+                2,
+                100,
+                "[POISON] req=%s cached=%d full=%d — re-registering",
+                request.request_id[-8:],
+                num_cached_blocks,
+                num_full_blocks,
+            )
             self._heal_missing_registrations(
                 request, num_full_blocks, retention_interval
             )
@@ -533,6 +572,10 @@ class SingleTypeKVCacheManager(ABC):
         )
 
         self.num_cached_block[request.request_id] = num_full_blocks
+        self._probe.sample(
+            request.request_id[-8:], 3, 100,
+            "[NCB] req=%s full=%d", request.request_id[-8:], num_full_blocks,
+        )
 
     def _heal_missing_registrations(
         self,
@@ -547,6 +590,7 @@ class SingleTypeKVCacheManager(ABC):
         honours the retention mask so mamba non-checkpoint slots stay out.
         """
         from vllm.v1.core.kv_cache_utils import make_block_hash_with_group_id
+        from vllm.v1.qwen_debug import qwen_debug_log as _qdbg
         _blocks = self.req_to_blocks.get(request.request_id, [])
         _hashes = getattr(request, "block_hashes", None) or []
         _limit = min(num_full_blocks, len(_blocks), len(_hashes))
@@ -566,15 +610,60 @@ class SingleTypeKVCacheManager(ABC):
                 else []
             ),
         )
+        _stat = {"masked": 0, "eq_nomap": 0, "diff": 0, "none": 0, "ins": 0}
+        from vllm.v1.core.kv_cache_utils import make_block_hash_with_group_id as _mk
         for _i in range(_limit):
             _blk = _blocks[_i]
-            if not _mask[_i] or _blk.block_hash is not None:
+            if getattr(_blk, "is_null", False):
+                _stat["nullblk"] = _stat.get("nullblk", 0) + 1
                 continue
+            _key = _mk(_hashes[_i], self.kv_cache_group_id)
+            if _mask is not None and not _mask[_i]:
+                _stat["masked"] += 1
+                continue
+            if _blk.block_hash == _key:
+                if self.block_pool.cached_block_hash_to_block.contain(
+                    _key, _blk.block_id
+                ):
+                    continue
+                _stat["eq_nomap"] += 1
+            else:
+                # Foreign or absent hash: the block's physical KV was written
+                # by THIS request last (it owns the position), so strip the
+                # stale registration and insert the expected key. Stripping
+                # also resets the block hash, keeping both sides consistent.
+                if _blk.block_hash is not None:
+                    _stat["diff"] += 1
+                    self.block_pool._remove_cached_block_hashes(_blk)
+                else:
+                    _stat["none"] += 1
+            self.block_pool._insert_block_hash(
+                _key, _blk, num_tokens=(_i + 1) * self.block_size
+            )
+            _stat["ins"] += 1
             self.block_pool._insert_block_hash(
                 make_block_hash_with_group_id(_hashes[_i], self.kv_cache_group_id),
                 _blk,
                 num_tokens=(_i + 1) * self.block_size,
             )
+        _resolved = sum(
+            1
+            for _j in range(_limit)
+            if self.block_pool.get_cached_block(
+                _hashes[_j], [self.kv_cache_group_id]
+            )
+            is not None
+        )
+        _qdbg(
+            "prefix",
+            "[HEAL] %s %s first3=%s head=%s resolved=%d/%d",
+            request.request_id[-8:],
+            _stat,
+            [_blocks[i].block_id for i in range(min(3, _limit))],
+            (_blocks[0].block_hash.hex()[-8:] if _blocks and _blocks[0].block_hash else None),
+            _resolved,
+            _limit,
+        )
 
 
     @classmethod
@@ -614,7 +703,12 @@ class SingleTypeKVCacheManager(ABC):
         # Default to [] in case a request is freed (aborted) before alloc.
         req_blocks = self.req_to_blocks.pop(request_id, [])
         self.num_cached_block.pop(request_id, None)
+        self._probe.every(
+            f"ncbfree-{request_id[-8:]}", 5.0,
+            "[NCB-FREE] req=%s", request_id[-8:],
+        )
         self._healed_reqs.discard(request_id)
+        self._seen_cache_blocks_reqs.discard(request_id)
         self._partial_hit_reqs.pop(request_id, None)
         return req_blocks
 
@@ -1942,6 +2036,8 @@ class MambaManager(SingleTypeKVCacheManager):
         if partial_hash is not None:
             self._partial_hit_reqs[request.request_id] = (block_idx, source_block)
             self.num_cached_block[request.request_id] = block_idx
+            from vllm.v1.qwen_debug import qwen_debug_log as _q
+            _q("prefix", "[NCB-COW] req=%s idx=%d", request.request_id[-8:], block_idx)
             # Producer of this partial tail: the boundary state currently lives
             # in ``source_block`` but the next step's forward overwrites it. The
             # upcoming CoW copies it into a durable cow_block; record the req so

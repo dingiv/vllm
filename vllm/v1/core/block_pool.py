@@ -203,6 +203,12 @@ class BlockPool:
         self.null_block = self.free_block_queue.popleft()
         self.null_block.is_null = True
 
+        from vllm.v1.qwen_debug import ProbeLogger
+
+        # Burst-tolerant probes: first N lines of a storm pass in full
+        # (forensics), then 1-in-M sampling keeps volume bounded.
+        self._probe = ProbeLogger("prefix")
+
         self.enable_kv_cache_events = enable_kv_cache_events
         self.kv_event_queue: list[KVCacheEvent] = []
 
@@ -250,8 +256,7 @@ class BlockPool:
             _key = request.request_id[-8:]
             _REG_TOT[_key] = _REG_TOT.get(_key, 0) + num_full_blocks
             _REG_N += 1
-            if _REG_N % 150 == 0:
-                _qdbg("prefix", "[REGTOT] %s", sorted(_REG_TOT.items()))
+            self._probe.every("regtot", 30.0, "[REGTOT] %s", sorted(_REG_TOT.items()))
         """Cache a list of full blocks for prefix caching.
         This function takes a list of blocks that will have their block hash
         metadata to be updated and cached. Given a request, it updates the
@@ -627,9 +632,12 @@ class BlockPool:
             ):
                 removed_hashes.append(block_hash)
         block.reset_hash()
-        _qdbg("prefix", "[RM] blk=%d n=%d k0=%s", block.block_id,
-              len(removed_hashes),
-              removed_hashes[0].hex()[-8:] if removed_hashes else "-")
+        self._probe.sample(
+            f"rm-{block.block_id}", 4, 200,
+            "[RM] blk=%d n=%d k0=%s", block.block_id,
+            len(removed_hashes),
+            removed_hashes[0].hex()[-8:] if removed_hashes else "-",
+        )
         return removed_hashes
 
     def _emit_block_removed_events(
@@ -672,8 +680,12 @@ class BlockPool:
                 block_hash_with_group_id
             )
         self.cached_block_hash_to_block.insert(block_hash_with_group_id, block)
-        _qdbg("prefix", "[I] blk=%d key=%s ntok=%s", block.block_id,
-              block_hash_with_group_id.hex()[-8:], num_tokens)
+        self.cached_block_hash_to_block.insert(block_hash_with_group_id, block)
+        self._probe.sample(
+            f"ins-{block.block_id}", 4, 200,
+            "[I] blk=%d key=%s ntok=%s", block.block_id,
+            block_hash_with_group_id.hex()[-8:], num_tokens,
+        )
 
     def move_block_hashes(
         self,
@@ -783,8 +795,11 @@ class BlockPool:
         if self.metrics_collector:
             self.metrics_collector.on_block_evicted(block)
 
-        _qdbg("prefix", "[EVICT-GPU] blk=%d key=%s", block.block_id,
-              block.block_hash.hex()[-8:] if block.block_hash else "-")
+        self._probe.sample(
+            f"evict-{block.block_id}", 4, 100,
+            "[EVICT-GPU] blk=%d key=%s", block.block_id,
+            block.block_hash.hex()[-8:] if block.block_hash else "-",
+        )
         evicted_hashes = self._remove_cached_block_hashes(block)
         if not evicted_hashes:
             # The block doesn't have hash, eviction is not needed

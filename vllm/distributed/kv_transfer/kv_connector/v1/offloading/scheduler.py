@@ -65,6 +65,9 @@ from vllm.v1.qwen_debug import OFFLOAD_PROBE as _QWEN_OFFLOAD_PROBE
 
 # [QKV] lookup DEFER 计数(req_id -> 重试次数;有界防泄漏)
 _QWEN_DEFER_CNTS: dict[str, int] = {}
+# LOCAL PROBE: 命中来源——该请求最近一次成功 lookup 是否经过了
+# 磁盘晋升(DEFER 过=fs tier,disk-promote;否则=RAM 区直读)。
+_QWEN_HIT_VIA: dict[str, str] = {}
 
 # LOCAL (2026-08-27, qwen38 project): checkpoint-stride sparsification for
 # recurrent / SWA groups. On hybrid-GDN topologies (Qwen3.8-DFlash2) every
@@ -997,7 +1000,10 @@ class OffloadingConnectorScheduler:
                             request.request_id[:10], _defer_cnt,
                         )
                 else:
-                    _QWEN_DEFER_CNTS.pop(request.request_id, None)
+                    _had_defers = _QWEN_DEFER_CNTS.pop(request.request_id, 0)
+                    _QWEN_HIT_VIA[request.request_id] = (
+                        "disk-promote" if _had_defers else "ram"
+                    )
                 _keys_per_group = [
                     len(gs.offload_keys) for gs in req_status.group_states
                 ]
@@ -1109,6 +1115,18 @@ class OffloadingConnectorScheduler:
                 group_state.next_stored_chunk_idx = num_chunks
 
         src_spec = self.manager.prepare_load(keys_to_load, req_status.req_context)
+        if _QWEN_OFFLOAD_PROBE and keys_to_load:
+            # [OFF-LOAD]: 卸载层回灌 GPU 池的确定点——prepare_load 已成,
+            # GET job 即将下发。via 区分 RAM 直读 vs 磁盘晋升(先 DEFER)。
+            logger.info(
+                "[OFF-LOAD] req=%s via=%s chunks=%d load_tokens=%d "
+                "dst_gpu_blocks=%d",
+                request.request_id[:10],
+                _QWEN_HIT_VIA.pop(request.request_id, "?"),
+                len(keys_to_load),
+                num_external_tokens,
+                len(dst_block_ids),
+            )
         dst_spec = GPULoadStoreSpec(
             dst_block_ids, group_sizes=group_sizes, block_indices=block_indices
         )
@@ -1514,6 +1532,14 @@ class OffloadingConnectorScheduler:
                 self.manager.complete_store(job_status.keys, req_status.req_context)
             else:
                 self.manager.complete_load(job_status.keys, req_status.req_context)
+                if _QWEN_OFFLOAD_PROBE:
+                    # [OFF-DONE]: GPU 侧拷贝已全部完成——缓存"确实命中"
+                    # 的终点证明。chunks 数与 [OFF-LOAD] 行对应。
+                    logger.info(
+                        "[OFF-DONE] req=%s chunks=%d",
+                        job_status.req_id[:10],
+                        len(job_status.keys),
+                    )
                 if self._chunks_being_loaded:
                     self._chunks_being_loaded.difference_update(job_status.keys)
             if self._block_id_to_pending_jobs:

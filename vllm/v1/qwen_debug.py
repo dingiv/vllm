@@ -22,6 +22,7 @@ fields on an existing logger.info) stay inline and do not use this.
 from __future__ import annotations
 
 import os
+import time
 
 from vllm.logger import init_logger
 
@@ -51,6 +52,62 @@ PREFIX_PROBE = "prefix" in _AREAS
 # legacy alias gives a finer value.
 _legacy_timing = int(os.environ.get("QWEN_TIMING") or 0)
 TIMING = 1 if "timing" in _AREAS and _legacy_timing == 0 else _legacy_timing
+
+# Per-instance probe state maps are bounded by this; on overflow they reset
+# (probe fidelity degrades to "first again" rather than growing unbounded).
+_PROBE_STATE_LIMIT = 1024
+
+
+class ProbeLogger:
+    """Rate-limited probe logger bound to one debug area.
+
+    Holds its own throttle state so call sites don't scatter module-level
+    dicts. Create per class in ``__init__`` (or as a class attribute when
+    several instances must share one budget, e.g. the 15 KV-group managers
+    sampling the same request).
+    """
+
+    def __init__(self, area: str) -> None:
+        self.area = area
+        self._last_emit: dict[str, float] = {}
+        self._counts: dict[str, int] = {}
+
+    def _on(self) -> bool:
+        return self.area in _AREAS
+
+    def log(self, msg: str, *args: object) -> None:
+        """Unthrottled passthrough (gated by area)."""
+        if self._on():
+            logger.info(msg, *args)
+
+    def every(self, key: str, seconds: float, msg: str, *args: object) -> None:
+        """Time-window throttle: at most one line per ``key`` per ``seconds``."""
+        if not self._on():
+            return
+        now = time.monotonic()
+        if now - self._last_emit.get(key, float("-inf")) < seconds:
+            return
+        if len(self._last_emit) >= _PROBE_STATE_LIMIT:
+            self._last_emit.clear()
+        self._last_emit[key] = now
+        logger.info(msg, *args)
+
+    def sample(
+        self, key: str, first: int, every_n: int, msg: str, *args: object
+    ) -> None:
+        """Count-sampling: first ``first`` lines pass, then 1-in-``every_n``."""
+        if not self._on():
+            return
+        n = self._counts.get(key, 0) + 1
+        if n <= first or n % every_n == 0:
+            if len(self._counts) >= _PROBE_STATE_LIMIT:
+                self._counts.clear()
+            self._counts[key] = n
+            logger.info(msg, *args)
+            return
+        if len(self._counts) >= _PROBE_STATE_LIMIT:
+            self._counts.clear()
+        self._counts[key] = n
 
 
 def qwen_debug_log(area: str, msg: str, *args: object) -> None:
