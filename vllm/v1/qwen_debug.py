@@ -6,9 +6,14 @@ All QWEN_* probe prints go through ``qwen_debug_log`` so there is one
 place to flip them on/off. The master switch is ``QWEN_DEBUG``; each
 probe keeps its historical env name as an alias:
 
+    qwen-server --debug offload,prefix,...   CLI (qwen38 fork serving pkg)
     QWEN_DEBUG=1|offload|timing|all    master (comma-separated areas or "all")
     QWEN_OFFLOAD_PROBE=1               alias for area "offload"
     QWEN_TIMING=1|2                    alias for area "timing" (2 = sampled)
+
+Off by default. "schedule" is not an area here: that probe family
+gates on QWEN_SCHED_PROBE (read at import by the scheduler files); the
+CLI translates it.
 
 Probes that merely *extend* an existing upstream log line (e.g. extra
 fields on an existing logger.info) stay inline and do not use this.
