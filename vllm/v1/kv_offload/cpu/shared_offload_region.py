@@ -86,32 +86,65 @@ class SharedOffloadRegion:
         )
 
         # MADV_POPULATE_WRITE was added in Linux 5.14 (value 23).
+        # LOCAL (qwen38, 2026-09-05): on this box the kernel bails out of
+        # mass-populate with EFAULT above ~43GiB (bisected; ~40% of RAM,
+        # well below the 53.8GiB tmpfs size, and it drifts day to day).
+        # Populate is only a pre-fault optimization — pages are written
+        # lazily on first touch anyway — so a failure now downgrades to a
+        # warning instead of killing engine init (the 48GiB region used
+        # to boot-fail nondeterministically on exactly this madvise).
         _MADV_POPULATE_WRITE = getattr(mmap, "MADV_POPULATE_WRITE", 23)
+        _populate_failed = False
         if rank is not None:
             # Populate only this worker's pages (one slot per block row).
             worker_offset = rank * cpu_page_size
             _t0 = time.perf_counter()
             page_size = self.page_size
-            for block in range(num_blocks):
-                raw_offset = block * self._row_stride + worker_offset
-                aligned_offset = (raw_offset // page_size) * page_size
-                end = raw_offset + cpu_page_size
-                aligned_length = end - aligned_offset
-                self.mmap_obj.madvise(
-                    _MADV_POPULATE_WRITE, aligned_offset, aligned_length
+            try:
+                for block in range(num_blocks):
+                    raw_offset = block * self._row_stride + worker_offset
+                    aligned_offset = (raw_offset // page_size) * page_size
+                    end = raw_offset + cpu_page_size
+                    aligned_length = end - aligned_offset
+                    self.mmap_obj.madvise(
+                        _MADV_POPULATE_WRITE, aligned_offset, aligned_length
+                    )
+            except OSError as e:
+                _populate_failed = True
+                logger.warning(
+                    "MADV_POPULATE_WRITE failed (%s) after %.3f s — "
+                    "continuing with lazy page faults; first stores will "
+                    "be slower. Consider shrinking --offload-ram or "
+                    "enlarging /dev/shm.",
+                    e,
+                    time.perf_counter() - _t0,
                 )
-            logger.debug(
-                "MADV_POPULATE_WRITE loop: %d blocks in %.3f s",
-                num_blocks,
-                time.perf_counter() - _t0,
-            )
+            if not _populate_failed:
+                logger.debug(
+                    "MADV_POPULATE_WRITE loop: %d blocks in %.3f s",
+                    num_blocks,
+                    time.perf_counter() - _t0,
+                )
         else:
             # No rank — populate the entire shared region in one call.
             _t0 = time.perf_counter()
-            self.mmap_obj.madvise(_MADV_POPULATE_WRITE, 0, self.total_size_bytes)
-            logger.debug(
-                "MADV_POPULATE_WRITE entire region: %.3f s", time.perf_counter() - _t0
-            )
+            try:
+                self.mmap_obj.madvise(
+                    _MADV_POPULATE_WRITE, 0, self.total_size_bytes
+                )
+            except OSError as e:
+                _populate_failed = True
+                logger.warning(
+                    "MADV_POPULATE_WRITE failed (%s) — continuing with "
+                    "lazy page faults. Consider shrinking --offload-ram "
+                    "or enlarging /dev/shm.",
+                    e,
+                )
+            if not _populate_failed:
+                logger.debug(
+                    "MADV_POPULATE_WRITE entire region: %.3f s",
+                    time.perf_counter() - _t0,
+                )
 
         self._base = torch.frombuffer(memoryview(self.mmap_obj), dtype=torch.int8)
         self._views: list[torch.Tensor] = []
