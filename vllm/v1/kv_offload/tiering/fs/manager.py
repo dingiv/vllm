@@ -18,6 +18,7 @@ File naming:  <base_path>_r<rank>/<hhh>/<hh>_g<group_idx>/<hash_hex>.bin
 import functools
 import json
 import os
+import threading
 import time
 from pathlib import Path
 from collections.abc import Iterable
@@ -97,6 +98,12 @@ class FsAsyncLookupManager(AsyncLookupManager):
             _r = list(batch_lookup_C(paths))
         else:
             _r = list(os.path.exists(p) for p in paths)
+        # LOCAL (qwen38 2026-09-06): refresh access recency for hits so
+        # quota eviction stops ranking them as old. Worker thread context:
+        # tier.record_touch is lock-guarded and persists to the sidecar log.
+        self._tier.record_touch(
+            [get_offload_block_hash(k).hex() for k, hit in zip(keys, _r) if hit]
+        )
         if OFFLOAD_PROBE:
             _ms = (_time.monotonic() - _t0) * 1000
             if _ms > 100:
@@ -234,6 +241,21 @@ class FileSystemTierManager(SecondaryTierManager):
         self._evict_blocked: set[str] = set()
         self._oversize_warned = False
         self._last_evict_log = 0.0
+        # LOCAL (qwen38 2026-09-06): access recency beyond file mtime.
+        # Eviction by raw mtime self-destructs revisit targets: data written
+        # by a PREVIOUS boot can rank among the oldest on disk, so the first
+        # revisit's recompute-stores trigger the quota debt sweep that deletes
+        # exactly the data being revisited (see
+        # docs/vllm/跨冷启动磁盘缓存失效-定位.md). Lookup hits record a
+        # last-access timestamp here and persist it to a sidecar log so the
+        # recency survives restarts. Eviction sorts by max(mtime, touch).
+        # Worker threads write (from batch_lookup); eviction reads on the
+        # scheduler thread -- _touch_lock guards both.
+        self._touch_lock = threading.Lock()
+        self._touch_map: dict[str, float] = {}
+        self._access_log_path = os.path.join(root_dir, ".access_log")
+        self._load_access_log()
+        self._access_log_fh = open(self._access_log_path, "a", encoding="ascii")
         # LOCAL (qwen38): chain-aware eviction scoring. When enabled,
         # candidates that anchor the low depths of a chain still alive in
         # this tier are skipped (deeper blocks go first), preserving the
@@ -260,6 +282,20 @@ class FileSystemTierManager(SecondaryTierManager):
                 "fs tier: no quota, existing usage=%d bytes "
                 "(recovery scan, scope=%s)",
                 self._used_kv_bytes, self._root,
+            )
+        # LOCAL (qwen38 2026-09-06): clear quota debt at startup, BEFORE
+        # serving traffic. Lazy eviction (debt swept on the first store)
+        # races the first request's lookup/promotion and has already eaten
+        # revisit targets mid-flight; paying the debt deterministically at
+        # boot removes the race. Recency comes from the access log (loaded
+        # above), so recently-used data is protected even across restarts.
+        if self._max_kv_bytes and self._used_kv_bytes > self._max_kv_bytes:
+            debt = self._used_kv_bytes - self._max_kv_bytes
+            freed = self._evict_oldest_chunks(debt)
+            logger.warning(
+                "fs tier startup debt: freed %d bytes (debt %d), usage now "
+                "%d / %d",
+                freed, debt, self._used_kv_bytes, self._max_kv_bytes,
             )
 
     def _iter_block_files(self) -> Iterable[str]:
@@ -291,6 +327,91 @@ class FileSystemTierManager(SecondaryTierManager):
         self._chunk_index = index
         self._evict_blocked.clear()
         self._used_kv_bytes = total
+        # Drop touch entries for chunks no longer present (post-recovery or
+        # post-rescan hygiene; eviction pops its own entries).
+        with self._touch_lock:
+            self._touch_map = {
+                k: v for k, v in self._touch_map.items() if k in index
+            }
+
+    def _load_access_log(self) -> None:
+        """Rebuild the touch map from the sidecar access log (restart
+        recovery). Reads at most the tail _ACCESS_LOG_TAIL_BYTES; compacts
+        the file when it outgrows _ACCESS_LOG_COMPACT_BYTES."""
+        path = self._access_log_path
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            return
+        try:
+            with open(path, "rb") as f:
+                if size > self._ACCESS_LOG_TAIL_BYTES:
+                    f.seek(-self._ACCESS_LOG_TAIL_BYTES, os.SEEK_END)
+                    f.readline()  # discard the partial line
+                blob = f.read().decode("ascii", errors="ignore")
+            now = time.time()
+            with self._touch_lock:
+                for line in blob.splitlines():
+                    parts = line.split()
+                    if len(parts) != 2:
+                        continue
+                    try:
+                        ts, h = float(parts[0]), parts[1]
+                    except ValueError:
+                        continue
+                    if ts > now:
+                        continue  # clock skew guard
+                    if v := self._touch_map.get(h):
+                        if ts <= v:
+                            continue
+                    self._touch_map[h] = ts
+            if size > self._ACCESS_LOG_COMPACT_BYTES:
+                self._compact_access_log_locked()
+        except OSError as e:
+            logger.warning("fs tier: access log recovery failed: %s", e)
+
+    def _compact_access_log_locked(self) -> None:
+        """Rewrite the access log keeping only the newest
+        _ACCESS_LOG_COMPACT_KEEP entries (call with _touch_lock held or
+        during __init__)."""
+        try:
+            with self._touch_lock:
+                entries = sorted(
+                    self._touch_map.items(), key=lambda kv: kv[1]
+                )[-self._ACCESS_LOG_COMPACT_KEEP:]
+                tmp = self._access_log_path + ".tmp"
+                with open(tmp, "w", encoding="ascii") as f:
+                    f.writelines(f"{ts:.3f} {h}\n" for h, ts in entries)
+                os.replace(tmp, self._access_log_path)
+        except OSError as e:
+            logger.warning("fs tier: access log compaction failed: %s", e)
+
+    def record_touch(self, hexes: list[str]) -> None:
+        """Record last-access time for chunk hashes (lookup hits).
+
+        Called from lookup worker threads: updates the in-memory recency map
+        and appends to the sidecar log (one line per hash) so recency
+        survives restarts. Single O_APPEND write per batch."""
+        if not hexes:
+            return
+        # Floor to the millisecond: rounding up could persist a timestamp a
+        # fraction of a millisecond ahead of the reader's clock, which the
+        # skew guard in _load_access_log would then drop.
+        now = time.time() // 0.001 * 0.001
+        with self._touch_lock:
+            for h in hexes:
+                self._touch_map[h] = now
+            try:
+                self._access_log_fh.writelines(f"{now:.3f} {h}\n" for h in hexes)
+                self._access_log_fh.flush()
+            except OSError as e:
+                logger.warning("fs tier: access log append failed: %s", e)
+
+    def _last_access(self, key: str, files: list) -> float:
+        """Eviction recency score: latest of file mtime and last touch."""
+        with self._touch_lock:
+            t = self._touch_map.get(key)
+        return max(t or 0.0, max(m for _, _, m in files))
 
     def _evict_oldest_chunks(self, need_bytes: int) -> int:
         """Delete oldest chunks (min mtime across the chunk's group files)
@@ -336,9 +457,7 @@ class FileSystemTierManager(SecondaryTierManager):
                             len(candidates),
                         )
                     pool = candidates
-            key, files = min(
-                pool, key=lambda kv: min(t for _, _, t in kv[1])
-            )
+            key, files = min(pool, key=lambda kv: self._last_access(*kv))
             chunk_bytes = sum(sz for _, sz, _ in files)
             removed = True
             for f, _, _ in files:
@@ -352,6 +471,8 @@ class FileSystemTierManager(SecondaryTierManager):
                 continue
             self._prune_empty_dirs(files)
             self._chunk_index.pop(key, None)
+            with self._touch_lock:
+                self._touch_map.pop(key, None)
             self._used_kv_bytes -= chunk_bytes
             freed += chunk_bytes
             if registry is not None:
@@ -361,6 +482,12 @@ class FileSystemTierManager(SecondaryTierManager):
     # LOCAL (qwen38): anchor zone width for chain-aware scoring, in blocks
     # beyond the chain's minimum depth present in this tier.
     _CHAIN_ANCHOR_SPAN = 2
+
+    # LOCAL (qwen38 2026-09-06): access-log tail to read at recovery and
+    # size at which the log gets compacted (kept entries bound it again).
+    _ACCESS_LOG_TAIL_BYTES = 16 << 20
+    _ACCESS_LOG_COMPACT_BYTES = 64 << 20
+    _ACCESS_LOG_COMPACT_KEEP = 100_000
 
     def _filter_chain_anchors(
         self,
@@ -556,3 +683,7 @@ class FileSystemTierManager(SecondaryTierManager):
         """
         self._lookup_manager.shutdown()
         self._pool.shutdown(wait=True)
+        try:
+            self._access_log_fh.close()
+        except OSError:
+            pass
