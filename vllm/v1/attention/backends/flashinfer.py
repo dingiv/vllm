@@ -30,6 +30,7 @@ from vllm.config import (
 from vllm.config.cache import CacheDType
 from vllm.distributed.parallel_state import get_dcp_group
 from vllm.logger import init_logger
+from vllm.v1.qwen_debug import TIMING as _QWEN_TIMING_ON
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
     kFp8StaticTensorSym,
@@ -640,6 +641,14 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             None  # Wrapper for non-causal prefill (DFlash)
         )
         self._decode_wrapper = None  # Wrapper for decode (general shape)
+        # Qwen38 P2a-v2 (Route Z, QWEN_MIXED_PLAN=1): per-row KV page-block
+        # counts baked into the last flashinfer plan, plus the batch row
+        # signature they belong to. Lets mixed spec-decode steps reuse the
+        # bound-derived host plan without a D2H sync, falling back to the
+        # exact sync path only when a decode row may have crossed a page
+        # boundary or the batch membership changed.
+        self._fi_mixed_planned_blocks: np.ndarray | None = None
+        self._fi_mixed_lazy_sig: object = None
 
         if envs.VLLM_BATCH_INVARIANT:
             self.decode_fixed_split_size = 2048
@@ -1120,6 +1129,8 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         common_attn_metadata: CommonAttentionMetadata,
         fast_build: bool = False,
     ) -> FlashInferMetadata:
+        import time as _t5
+        _e0 = _t5.perf_counter() if _QWEN_TIMING_ON else 0.0
         num_reqs = common_attn_metadata.num_reqs
         num_actual_tokens = common_attn_metadata.num_actual_tokens
         causal = common_attn_metadata.causal
@@ -1233,6 +1244,127 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         needs_seq_lens_cpu = self.use_dcp or use_cascade or not all_uses_trtllm
         seq_lens_cpu = common_attn_metadata.seq_lens_cpu if needs_seq_lens_cpu else None
         seq_lens_np = seq_lens_cpu.numpy() if seq_lens_cpu is not None else None
+
+        # Qwen38 P2a-v2 (Route Z, QWEN_MIXED_PLAN=1): the hint is a CPU upper
+        # bound on mixed spec-decode batches (decode rows overshoot by their
+        # rejected count). Host plan arrays from an upper bound only
+        # over-partition the split-kv scheduler — safe — while the wrapper's
+        # device buffers get corrected with exact device seq_lens via D2D
+        # copies after plan (empirically bitwise-exact, see
+        # r1_route_z_probe.py). The one unsafe case is a decode row whose
+        # optimistic page-block count exceeds the exact one: the kernel walks
+        # indptr pages without clamping, so we must fall back to the exact
+        # (sync) path for that rare step (~1/page_width per row per step).
+        # Prefill rows' bounds are exact, so chunk-boundary crossings there
+        # never trigger the fallback.
+        mixed_bound_plan = (
+            common_attn_metadata.seq_lens_cpu_hint is not None
+            and common_attn_metadata.seq_lens_cpu_hint_is_bound
+            and not self.use_dcp
+            and not use_cascade
+            and not all_uses_trtllm
+            and num_decodes == 0
+            and seq_lens_np is not None
+        )
+        if mixed_bound_plan:
+            opt_blocks_np = (seq_lens_np + (page_size - 1)) // page_size
+            lazy_sig = (num_reqs, common_attn_metadata.draft_row_sig)
+            _g0 = _t5.perf_counter() if _QWEN_TIMING_ON else 0.0
+            is_prefill_np = (
+                common_attn_metadata.is_prefilling.cpu().numpy()
+                if common_attn_metadata.is_prefilling is not None
+                else None
+            )
+            if _QWEN_TIMING_ON:
+                from vllm.logger import init_logger as _il3
+                _il3(__name__).info(
+                    "[RZM6] is_prefilling.cpu()=%.1fms dev=%s ntok=%d",
+                    1000 * (_t5.perf_counter() - _g0),
+                    getattr(common_attn_metadata.is_prefilling, "device", "?"),
+                    num_actual_tokens,
+                )
+            planned = self._fi_mixed_planned_blocks
+            need_exact = (
+                is_prefill_np is None
+                or planned is None
+                or planned.shape[0] != num_reqs
+                or self._fi_mixed_lazy_sig != lazy_sig
+                or bool(
+                    np.any(
+                        (~is_prefill_np[:num_reqs])
+                        & (opt_blocks_np != planned)
+                    )
+                )
+            )
+            if _QWEN_TIMING_ON:
+                from vllm.logger import init_logger as _il4
+                _il4(__name__).info(
+                    "[RZX] need_exact=%s sig_chg=%s mask_none=%s shape=%s cross=%s ntok=%d",
+                    need_exact,
+                    self._fi_mixed_lazy_sig != lazy_sig,
+                    is_prefill_np is None,
+                    planned is None or planned.shape[0] != num_reqs,
+                    planned is not None and is_prefill_np is not None and planned.shape[0] == num_reqs and bool(np.any((~is_prefill_np[:num_reqs]) & (opt_blocks_np != planned))),
+                    num_actual_tokens,
+                )
+            if need_exact:
+                # Rare: first step, batch membership change, or a decode row
+                # may have crossed a page boundary since the last exact plan.
+                # Sync exact lens and let everything downstream derive from
+                # them (this is the legacy per-step cost, paid ~1% of steps).
+                # NOTE (P2c-v2 falsified 2026-09-08): skipping this sync on
+                # growth crossings (trusting the over-partitioned hint + D2D
+                # correction) DIVERGES bitwise (G2 unit test, max|diff|~0.76
+                # when the overshoot crosses INTO a new page). Probes E/Z had
+                # only verified within-page overshoot. The fallback stays.
+                _f0 = _t5.perf_counter() if _QWEN_TIMING_ON else 0.0
+                seq_lens_cpu = common_attn_metadata.seq_lens.to("cpu")
+                # Populate the property cache on the shared metadata object so
+                # sibling builders don't re-sync the same tensor.
+                common_attn_metadata._seq_lens_cpu = seq_lens_cpu
+                if _QWEN_TIMING_ON:
+                    from vllm.logger import init_logger as _il5
+
+                    _hint_pre = seq_lens_np  # host hint BEFORE exact overwrite
+                    seq_lens_np = seq_lens_cpu.numpy()
+                    _il5(__name__).info(
+                        "[RZQ] fallback_sync=%.1fms ntok=%d",
+                        1000 * (_t5.perf_counter() - _f0),
+                        num_actual_tokens,
+                    )
+                    if (
+                        planned is not None
+                        and planned.shape[0] == num_reqs
+                        and is_prefill_np is not None
+                    ):
+                        _dr = np.where(
+                            (~is_prefill_np[:num_reqs])
+                            & (opt_blocks_np != planned)
+                        )[0]
+                        _il5(__name__).info(
+                            "[RZQ] ndiff=%d sig=%s",
+                            len(_dr),
+                            self._fi_mixed_lazy_sig != lazy_sig,
+                        )
+                        for r in _dr[:2]:
+                            _r = int(r)
+                            _ex = int(seq_lens_cpu[_r])
+                            _il5(__name__).info(
+                                "[RZQ] row=%d hint_pre=%d opt=%d planned=%d "
+                                "exact=%d exact_blk=%d d=hint-exact=%d "
+                                "page=%d",
+                                _r,
+                                int(_hint_pre[_r]),
+                                int(opt_blocks_np[_r]),
+                                int(planned[_r]),
+                                _ex,
+                                (_ex + page_size - 1) // page_size,
+                                int(_hint_pre[_r]) - _ex,
+                                page_size,
+                            )
+                else:
+                    seq_lens_np = seq_lens_cpu.numpy()
+
         num_blocks_np = (
             (seq_lens_np + (page_size - 1)) // page_size
             if seq_lens_np is not None
@@ -1280,6 +1412,8 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         if needs_paged_kv_indices:
             assert num_blocks_np is not None
             assert seq_lens_np is not None
+            import time as _time2
+            _q0 = _time2.perf_counter() if _QWEN_TIMING_ON else 0.0
             paged_kv_indices = self._compute_flashinfer_kv_metadata(
                 num_blocks_np,
                 seq_lens_np,
@@ -1287,6 +1421,13 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 num_reqs,
                 page_size,
             )
+            if _QWEN_TIMING_ON:
+                from vllm.logger import init_logger as _il2
+                _il2(__name__).info(
+                    "[RZM2] kv-metadata=%.1fms entry-to-gather=%.1fms ntt=%d",
+                    1000 * (_time2.perf_counter() - _q0),
+                    1000 * (_q0 - _e0), num_actual_tokens,
+                )
         else:
             paged_kv_indices = None
 
@@ -1390,6 +1531,10 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             else:
                 prefill_wrapper = self._get_prefill_wrapper(causal=attn_metadata.causal)
                 # Slicing CPU buffers that are only needed for FI native prefills
+                import os as _os
+                _rzp = _QWEN_TIMING_ON
+                import time as _time
+                _rzt0 = _time.perf_counter() if _rzp else 0.0
                 paged_kv_last_page_len_prefill_cpu = self.paged_kv_last_page_len.cpu[
                     prefill_start:num_reqs
                 ]
@@ -1448,6 +1593,49 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                         fixed_split_size=self.prefill_fixed_split_size,
                         disable_split_kv=self.disable_split_kv,
                     )
+                    if _rzp:
+                        _rzt1 = _time.perf_counter()
+                        from vllm.logger import init_logger as _il
+                        _il(__name__).info(
+                            "[RZM] fi-plan=%.1fms total=%.1fms ntt=%d",
+                            1000 * (_rzt1 - _rzt0),
+                            1000 * (_rzt1 - _rzt0),
+                            num_actual_tokens,
+                        )
+                    if mixed_bound_plan:
+                        # Route Z correction: overwrite the wrapper's device
+                        # buffers with values derived from the EXACT device
+                        # seq_lens. The kernel reads its per-batch bounds
+                        # (kv_lens / last_page_len / indptr pages) from these
+                        # buffers at run time, so the over-partitioned host
+                        # plan inputs cannot poison reads (bitwise-verified in
+                        # r1_lazy_plan_probe.py / r1_route_z_probe.py).
+                        lens_dev = common_attn_metadata.seq_lens[:num_reqs]
+                        nb_dev = (lens_dev + (page_size - 1)) // page_size
+                        lp_dev = (lens_dev - (nb_dev - 1) * page_size).to(
+                            torch.int32
+                        )
+                        indptr_dev = torch.empty(
+                            num_reqs + 1, dtype=torch.int32, device=lens_dev.device
+                        )
+                        indptr_dev[0] = 0
+                        torch.cumsum(
+                            nb_dev, dim=0, dtype=torch.int32, out=indptr_dev[1:]
+                        )
+                        prefill_wrapper._kv_lens_buffer[:num_reqs].copy_(
+                            lens_dev.to(torch.int32), non_blocking=True
+                        )
+                        prefill_wrapper._paged_kv_last_page_len_buf[
+                            :num_reqs
+                        ].copy_(lp_dev, non_blocking=True)
+                        prefill_wrapper._paged_kv_indptr_buf[: num_reqs + 1].copy_(
+                            indptr_dev, non_blocking=True
+                        )
+                        # Remember the blocks actually baked into this plan so
+                        # the next step can tell optimistic crossings apart
+                        # from normal growth without any device sync.
+                        self._fi_mixed_planned_blocks = num_blocks_np[:num_reqs].copy()
+                        self._fi_mixed_lazy_sig = lazy_sig
                 attn_metadata.prefill = FIPrefill(wrapper=prefill_wrapper)
 
         ## DECODE PATHWAY

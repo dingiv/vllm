@@ -27,6 +27,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+from vllm.v1.qwen_debug import TIMING as _QWEN_TIMING_ON
+
 import vllm.envs as envs
 from vllm.compilation.counter import compilation_counter
 from vllm.config import VllmConfig
@@ -84,6 +86,7 @@ from vllm.v1.worker.gpu.input_batch import (
     InputBuffers,
     combine_sampled_and_draft_tokens,
     expand_idx_mapping,
+    merge_exact_computed_mirror,
     post_update,
     post_update_num_computed_tokens,
     prepare_pos_seq_lens,
@@ -251,6 +254,30 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             max_num_tokens=self.max_num_tokens,
             device=self.device,
         )
+        # Qwen38 P2c (2026-09-08): async D2H mirror of the exact GPU-side
+        # num_computed_tokens. The CPU mirror (num_computed_tokens_np) is
+        # only fed from scheduler values, which under async spec scheduling
+        # are optimistic and never rejection-corrected on the worker — the
+        # unbounded drift (~+s tokens/step, [RZS]/[RZX] probes) makes the
+        # Route Z mixed-plan hint cross page boundaries every step and
+        # re-trigger the exact-sync fallback (~430ms/step). The GPU value is
+        # exact (post_update applies query_len - num_rejected every step),
+        # so we snapshot it into pinned memory right after post_update and
+        # merge it into the CPU mirror at the next execute_model. The env
+        # var must be set inside the engine process (numa spawn chain does
+        # not inherit shell env); serve.py --exact-mirror does that.
+        import os as _os
+
+        self.exact_computed_mirror_on = _os.environ.get(
+            "QWEN_EXACT_COMPUTED_MIRROR", "0"
+        ) not in ("0", "", "false")
+        if self.exact_computed_mirror_on:
+            self.exact_computed_cpu = torch.zeros(
+                self.max_num_reqs, dtype=torch.int32, pin_memory=True
+            )
+            self.exact_computed_event = torch.Event()
+            self.exact_computed_pending = False
+            self.exact_computed_slots: list[tuple[str, int]] = []
         if self.use_pp:
             self.pp_handler = PPHandler(
                 max_num_reqs=self.max_num_reqs,
@@ -1272,6 +1299,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if not dummy_run:
             # Common case.
             # Prepare all the inputs and copy to the input buffers.
+            if self.exact_computed_mirror_on and self.exact_computed_pending:
+                self._merge_exact_computed_mirror()
             input_batch = self.prepare_inputs(scheduler_output, batch_desc)
             block_tables, slot_mappings = self.prepare_attn(input_batch)
             # Mamba "align" pre-copy: migrate recurrent state across block
@@ -1565,6 +1594,24 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             input_batch.query_start_loc,
         )
 
+        if self.exact_computed_mirror_on:
+            # Qwen38 P2c: post_update has made the GPU num_computed_tokens
+            # exact for every row of this batch; snapshot it (async, pinned)
+            # for the next step's CPU-mirror merge. The copy overlaps with
+            # the draft proposal below; the event is synced at the next
+            # execute_model, by which time it has long since landed.
+            self.exact_computed_cpu.copy_(
+                self.req_states.num_computed_tokens.gpu, non_blocking=True
+            )
+            self.exact_computed_event.record()
+            self.exact_computed_pending = True
+            self.exact_computed_slots = list(
+                zip(
+                    input_batch.req_ids,
+                    input_batch.idx_mapping_np[: input_batch.num_reqs].tolist(),
+                )
+            )
+
         if self.speculator is not None:
             assert self.sampler is not None
             # Let the target override the hidden state fed to the drafter
@@ -1665,6 +1712,35 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.req_states.num_computed_tokens.gpu,
             input_batch.query_start_loc,
         )
+
+    def _merge_exact_computed_mirror(self) -> None:
+        # Qwen38 P2c: fold the previous step's exact GPU num_computed_tokens
+        # snapshot (event-synced D2H, enqueued right after post_update) into
+        # the optimistic CPU mirror. Only rows that were in the copy-time
+        # batch AND still map to the same req_state slot are merged:
+        #   - finished rows: req_id no longer in req_id_to_index -> skipped
+        #   - new rows: not in the snapshot slot list -> keep scheduler value
+        #   - preempted/re-added rows: slot rewritten by add_requests with the
+        #     rolled-back truth, while the stale snapshot may be HIGHER ->
+        #     the min() merge keeps the scheduler value in that direction.
+        self.exact_computed_event.synchronize()
+        self.exact_computed_pending = False
+        rows, lowered = merge_exact_computed_mirror(
+            self.req_states.num_computed_tokens_np,
+            self.exact_computed_cpu.numpy(),
+            self.exact_computed_slots,
+            self.req_states.req_id_to_index,
+        )
+        self.exact_computed_slots = []
+        if rows and _QWEN_TIMING_ON:
+            logger.info("[RZC] exact-mirror rows=%d lowered=%d", rows, lowered)
+        if rows:
+            # Refresh the derived mirror, same as update_requests does.
+            np.minimum(
+                self.req_states.num_computed_tokens_np,
+                self.req_states.prefill_len.np,
+                out=self.req_states.num_computed_prefill_tokens,
+            )
 
     def shutdown(self) -> None:
         """Release GPU tensors (model weights, KV caches, workspace) so that

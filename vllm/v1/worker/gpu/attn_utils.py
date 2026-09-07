@@ -17,6 +17,7 @@ from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.utils.torch_utils import get_dtype_size
+from vllm.v1.qwen_debug import TIMING as _QWEN_TIMING_ON
 from vllm.v1.attention.backend import (
     AttentionCGSupport,
     CommonAttentionMetadata,
@@ -511,6 +512,8 @@ def build_attn_metadata(
     kv_cache_config: KVCacheConfig,
     seq_lens_cpu_upper_bound: torch.Tensor | None = None,
     seq_lens_cpu_hint: torch.Tensor | None = None,
+    seq_lens_cpu_hint_is_bound: bool = False,
+    draft_row_sig: object = None,
     dcp_local_seq_lens: torch.Tensor | None = None,
     positions: torch.Tensor | None = None,
     is_prefilling: torch.Tensor | None = None,
@@ -554,6 +557,8 @@ def build_attn_metadata(
             seq_lens=seq_lens,
             seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
             seq_lens_cpu_hint=seq_lens_cpu_hint,
+            seq_lens_cpu_hint_is_bound=seq_lens_cpu_hint_is_bound,
+            draft_row_sig=draft_row_sig,
             max_seq_len=max_seq_len,
             num_reqs=num_reqs,
             num_actual_tokens=num_tokens,
@@ -584,11 +589,23 @@ def build_attn_metadata(
                     if model_specific_attn_metadata is not None
                     else {}
                 )
+                import time as _t, os as _o
+                _b0 = _t.perf_counter() if _QWEN_TIMING_ON else 0.0
                 metadata = attn_metadata_builder.build(
                     common_prefix_len=0,
                     common_attn_metadata=common_attn_metadata,
                     **attn_metadata_extra_kwargs,
                 )
+                if _QWEN_TIMING_ON:
+                    from vllm.logger import init_logger as _il
+                    _il(__name__).info(
+                        "[RZG] %s layer=%s causal=%s build=%.1fms ntok=%d",
+                        type(attn_metadata_builder).__name__,
+                        (attn_group.layer_names[0][:24]
+                         if attn_group.layer_names else "?"),
+                        getattr(common_attn_metadata, "causal", "?"),
+                        1000 * (_t.perf_counter() - _b0), num_tokens,
+                    )
             for layer_name in attn_group.layer_names:
                 attn_metadata[layer_name] = metadata
     return attn_metadata

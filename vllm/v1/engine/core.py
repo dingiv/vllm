@@ -117,6 +117,9 @@ class EngineCore:
         load_general_plugins()
 
         self.vllm_config = vllm_config
+        # LOCAL P1' (mirrors upstream #54627): step counter driving the
+        # prefill_schedule_interval cadence for single-engine runs.
+        self._prefill_cadence_step = 0
         if not vllm_config.parallel_config.data_parallel_rank_local:
             logger.info(
                 "Initializing a V1 LLM engine (v%s) with config: %s",
@@ -577,9 +580,21 @@ class EngineCore:
             eco.scheduler_stats.iteration_details = iteration_details
 
     def _should_throttle_prefills(self) -> bool:
-        """Whether to defer new prefills this step (DP prefill balancing).
-        Overridden by the DP engine core; never throttles otherwise."""
-        return False
+        """Whether to defer prefill compute this step (DP prefill balancing;
+        overridden by the DP engine core).
+
+        LOCAL P1' (mirrors upstream #54627): single-engine runs also honor
+        ``prefill_schedule_interval`` — prefill compute (including in-flight
+        chunked-prefill continuations; see Scheduler.schedule's defer_prefills)
+        is deferred to cadence-aligned steps while decode work is runnable,
+        protecting active decode streams from long-prefill starvation
+        (docs/vllm/并发解码挤占-P2施工文档.md; #54919). Default interval=1
+        keeps legacy behavior byte-for-byte."""
+        interval = self.vllm_config.scheduler_config.prefill_schedule_interval
+        if interval <= 1:
+            return False
+        self._prefill_cadence_step += 1
+        return self._prefill_cadence_step % interval != 0
 
     def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
         """Schedule, execute, and make output.

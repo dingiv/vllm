@@ -12,6 +12,7 @@ from vllm.config import VllmConfig, get_layers_from_vllm_config
 from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed.eplb.eplb_state import EplbState
 from vllm.logger import init_logger
+from vllm.v1.qwen_debug import TIMING as _QWEN_TIMING_ON
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu.attn_utils import (
@@ -198,6 +199,17 @@ class DraftModelSpeculator(BaseSpeculator):
             self.device,
             active_layer_names=self.draft_attn_layer_names,
         )
+        # LOCAL PROBE: draft attn groups' page sizes (R1.6 页宽矛盾裁决:
+        # [RZ] 算术暗示 16,offload config 全组 1648 —— 启动时打实)
+        import os as _os
+        if _QWEN_TIMING_ON:
+            _pages = sorted({
+                g.kv_cache_spec.block_size
+                for grp in self.attn_groups
+                for g in grp
+            })
+            from vllm.logger import init_logger as _il
+            _il(__name__).info("[RZP] draft attn group pages: %s", _pages)
         self.block_tables = block_tables
         # The target model runner's buffers and attention groups. Draft
         # prefill reuses the target model's attention metadata, so its
@@ -217,6 +229,9 @@ class DraftModelSpeculator(BaseSpeculator):
         causal: bool | Mapping[int, bool] = True,
         query_start_loc_np: np.ndarray | None = None,
         upper_bound_is_exact: bool = False,
+        hint_is_bound: bool = False,
+        is_prefilling: torch.Tensor | None = None,
+        row_sig: object = None,
     ) -> dict[str, Any] | None:
         if query_start_loc_np is not None:
             # Non-uniform query layout (e.g. multi-module MTP's mixed
@@ -251,6 +266,20 @@ class DraftModelSpeculator(BaseSpeculator):
             out=draft_seq_lens_cpu_upper_bound[:num_reqs],
         )
         draft_seq_lens_cpu_upper_bound[:num_reqs].clamp_(max=self.max_model_len)
+        # When every row is a prefill row, the target-side upper bound is
+        # exact, so target_bound + step == the device seq_lens maintained
+        # by the draft input kernel (context + query). Feeding it as the
+        # CPU hint lets attention builders skip the per-step implicit
+        # D2H sync in the deprecated seq_lens_cpu property.
+        # Qwen38 P2a-v2 (Route Z): with hint_is_bound (QWEN_MIXED_PLAN=1)
+        # the bound is fed even on mixed batches — decode rows overshoot
+        # by their rejected count, which the FlashInfer builder treats as
+        # an over-partition-safe host plan input and corrects with exact
+        # device seq_lens via D2D copies (see FlashInferMetadataBuilder).
+        use_bound_hint = upper_bound_is_exact or hint_is_bound
+        import os as _os, time as _time
+        _rzb = _QWEN_TIMING_ON
+        _rz_t0 = _time.perf_counter() if _rzb else 0.0
         attn_metadata = build_attn_metadata(
             attn_groups=self.attn_groups,
             num_reqs=num_reqs_padded,
@@ -267,15 +296,19 @@ class DraftModelSpeculator(BaseSpeculator):
             kv_cache_config=self.kv_cache_config,
             causal=causal,
             seq_lens_cpu_upper_bound=draft_seq_lens_cpu_upper_bound,
-            # When every row is a prefill row, the target-side upper bound is
-            # exact, so target_bound + step == the device seq_lens maintained
-            # by the draft input kernel (context + query). Feeding it as the
-            # CPU hint lets attention builders skip the per-step implicit
-            # D2H sync in the deprecated seq_lens_cpu property.
             seq_lens_cpu_hint=draft_seq_lens_cpu_upper_bound
-            if upper_bound_is_exact
+            if use_bound_hint
             else None,
+            seq_lens_cpu_hint_is_bound=hint_is_bound and not upper_bound_is_exact,
+            is_prefilling=is_prefilling,
+            draft_row_sig=row_sig,
         )
+        if _rzb:
+            from vllm.logger import init_logger as _il
+            _il(__name__).info(
+                "[RZB] build_attn_metadata=%.1fms ntok=%d",
+                1000 * (_time.perf_counter() - _rz_t0), num_tokens_padded,
+            )
         return attn_metadata
 
     def _validate_local_argmax_reduction(self) -> None:

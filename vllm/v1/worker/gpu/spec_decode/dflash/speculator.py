@@ -33,6 +33,14 @@ logger = init_logger(__name__)
 # LOCAL PROBE: per-propose phase breakdown via vllm.v1.qwen_debug
 # (QWEN_DEBUG=timing, or legacy QWEN_TIMING=1 every propose / =2 1-in-50).
 from vllm.v1.qwen_debug import TIMING as _QWEN_TIMING
+_QWEN_TIMING_ON = bool(_QWEN_TIMING)
+
+# Qwen38 P2a-v2 (Route Z): feed the CPU upper bound as the seq_lens hint on
+# mixed spec-decode batches too, so the FlashInfer builder can skip the
+# per-step D2H sync (430ms/step under deep queues) and correct the plan's
+# device buffers with exact device seq_lens via D2D copies instead.
+# 0 (default) = byte-for-byte legacy behavior.
+_QWEN_MIXED_PLAN = os.environ.get("QWEN_MIXED_PLAN", "0") not in ("0", "", "false")
 
 
 class DFlashSpeculator(DraftModelSpeculator):
@@ -321,6 +329,9 @@ class DFlashSpeculator(DraftModelSpeculator):
         causal: bool | Mapping[int, bool] = False,
         query_start_loc_np: np.ndarray | None = None,
         upper_bound_is_exact: bool = False,
+        hint_is_bound: bool = False,
+        is_prefilling: torch.Tensor | None = None,
+        row_sig: object = None,
     ) -> dict[str, Any] | None:
         if not self.draft_attn_layer_names:
             return None
@@ -335,6 +346,9 @@ class DFlashSpeculator(DraftModelSpeculator):
             causal=causal,
             query_start_loc_np=query_start_loc_np,
             upper_bound_is_exact=upper_bound_is_exact,
+            hint_is_bound=hint_is_bound,
+            is_prefilling=is_prefilling,
+            row_sig=row_sig,
         )
 
     @torch.inference_mode()
@@ -491,6 +505,7 @@ class DFlashSpeculator(DraftModelSpeculator):
         # Decode / mixed batches keep the exact sync: the bound is optimistic
         # there and overshoot would poison draft attention with stale pages.
         upper_bound_is_exact = bool(input_batch.is_prefilling_np[:num_reqs].all())
+        mixed_plan = _QWEN_MIXED_PLAN and not upper_bound_is_exact
 
         # Rebuild the draft attention metadata even when replaying the FULL
         # graph so that any attention metadata builder state is updated.
@@ -502,6 +517,17 @@ class DFlashSpeculator(DraftModelSpeculator):
             step=self.num_query_per_req,
             causal=self._group_causal,
             upper_bound_is_exact=upper_bound_is_exact,
+            hint_is_bound=mixed_plan,
+            is_prefilling=(
+                torch.from_numpy(input_batch.is_prefilling_np[:num_reqs].copy())
+                if mixed_plan
+                else None
+            ),
+            row_sig=(
+                (num_reqs, hash(tuple(input_batch.req_ids[:num_reqs])))
+                if mixed_plan
+                else None
+            ),
         )
         draft_slot_mappings_by_layer = build_slot_mappings_by_layer(
             self.block_tables.slot_mappings[:, :num_tokens_padded],

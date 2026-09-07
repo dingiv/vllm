@@ -611,6 +611,36 @@ def post_update_num_computed_tokens(
     )
 
 
+def merge_exact_computed_mirror(
+    num_computed_tokens_np: np.ndarray,
+    exact_np: np.ndarray,
+    slots: list[tuple[str, int]],
+    req_id_to_index: dict[str, int],
+) -> tuple[int, int]:
+    """Qwen38 P2c: merge the exact GPU-side num_computed_tokens snapshot
+    (event-synced D2H taken right after the previous step's post_update)
+    into the optimistic CPU mirror.
+
+    Only lowers values (min), and only for rows that were in the copy-time
+    batch and still map to the same req_state slot — this keeps finished /
+    newly-added / preempted-re-added rows on their scheduler-authoritative
+    values. After the merge, ``num_computed_tokens_np + num_scheduled``
+    equals the device seq_lens exactly (the drift source of the Route Z
+    cross-fallback is gone). Returns (rows_merged, total_lowered).
+    """
+    rows = 0
+    lowered = 0
+    for req_id, slot in slots:
+        if req_id_to_index.get(req_id) != slot:
+            continue
+        exact = int(exact_np[slot])
+        if exact < num_computed_tokens_np[slot]:
+            lowered += int(num_computed_tokens_np[slot]) - exact
+            num_computed_tokens_np[slot] = exact
+            rows += 1
+    return rows, lowered
+
+
 @triton.jit
 def _expand_idx_mapping_kernel(
     idx_mapping_ptr,

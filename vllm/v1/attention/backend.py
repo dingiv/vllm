@@ -474,6 +474,20 @@ class CommonAttentionMetadata:
     speculator on all-prefill rows). The deprecated ``seq_lens_cpu``
     property prefers it to avoid an implicit D2H sync per step."""
 
+    seq_lens_cpu_hint_is_bound: bool = False
+    """Qwen38 P2a-v2 (Route Z): when True, ``seq_lens_cpu_hint`` is a CPU
+    *upper bound* rather than an exact copy (mixed spec-decode batches).
+    The FlashInfer builder then uses it only for host-side plan arrays
+    (over-partition is safe) and corrects the wrapper's device buffers
+    with the exact device seq_lens via D2D copies — no D2H sync. Rare
+    decode-row page-boundary crossings fall back to the exact sync path."""
+
+    draft_row_sig: object = None
+    """Row-identity signature (e.g. (num_reqs, req_id hash)) maintained by
+    the draft speculator. The builder invalidates its cached per-row block
+    counts when it changes, so planned-block reuse can never be fooled by
+    a same-size batch with different requests (condense/add/remove)."""
+
     mm_req_doc_ranges: dict[int, list[tuple[int, int]]] | None = None
     """PrefixLM bidirectional ranges for multimodal tokens. Maps
     request index to list of (start, end) token position ranges
@@ -522,6 +536,20 @@ class CommonAttentionMetadata:
             if self.seq_lens_cpu_hint is not None:
                 self._seq_lens_cpu = self.seq_lens_cpu_hint
             else:
+                # LOCAL PROBE: expose when the deprecated property forces a
+                # real D2H sync (vs the hint path) — [RZS] under timing.
+                from vllm.v1.qwen_debug import TIMING as _t
+                if _t:
+                    import time as _time
+                    from vllm.logger import init_logger as _il
+                    _s0 = _time.perf_counter()
+                    self._seq_lens_cpu = self.seq_lens.to("cpu")
+                    _il("vllm.v1.attention.backend").info(
+                        "[RZS] seq_lens_cpu SYNC=%.1fms ntok=%d",
+                        1000 * (_time.perf_counter() - _s0),
+                        self.num_actual_tokens,
+                    )
+                    return self._seq_lens_cpu
                 self._seq_lens_cpu = self.seq_lens.to("cpu")
         return self._seq_lens_cpu
 
