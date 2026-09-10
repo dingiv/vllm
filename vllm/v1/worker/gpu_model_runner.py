@@ -2104,6 +2104,25 @@ class GPUModelRunner(
         )
         self.discard_request_mask.copy_to_gpu(num_reqs)
 
+        # [QWEN_DISCARD_PROBE] 排查 grammar×prefix 丢弃 bug:记录持续丢弃的请求
+        if self.discard_request_mask.np[:num_reqs].any() and __import__("os").environ.get("QWEN_DISCARD_PROBE"):
+            import time as _t
+            for _i in np.nonzero(self.discard_request_mask.np[:num_reqs])[0]:
+                _rid = self.input_batch.req_ids[int(_i)]
+                _req = self.requests.get(_rid)
+                logger.info(
+                    "[DISCARD-PROBE] req=%s optimistic=%d num_tokens=%d "
+                    "num_computed=%d scheduled=%d output_len=%d t=%.3f",
+                    _rid,
+                    int(self.optimistic_seq_lens_cpu[int(_i)]),
+                    int(num_tokens_np[_i]),
+                    int(_req.num_computed_tokens) if _req else -1,
+                    len(scheduler_output.scheduled_spec_decode_tokens.get(_rid, ()))
+                    if (scheduler_output is not None) else -1,
+                    len(_req._output_token_ids) if _req else -1,
+                    _t.perf_counter() % 1000,
+                )
+
         # Sync num_accepted_tokens from CPU (set by
         # _update_states_after_model_execute for hybrid models).
         # Skipped under async scheduling (non-align): the CPU copy races with
